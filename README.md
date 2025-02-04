@@ -120,6 +120,8 @@ Each command has its own set of subcommands and options.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
+
 
   - **Examples:**
 
@@ -145,6 +147,7 @@ Each command has its own set of subcommands and options.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
 
   - **Examples:**
 
@@ -174,6 +177,7 @@ Each command has its own set of subcommands and options.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to derive the default key filename if `key_filename` is not provided.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
 
   - **Examples:**
 
@@ -202,6 +206,7 @@ Each command has its own set of subcommands and options.
     - `-k, --keys`: Show full key details, including the full key content.
     - `-e, --extend`: Extend column widths to fit content for better readability.
     - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
 
   - **Examples:**
 
@@ -230,6 +235,7 @@ Each command has its own set of subcommands and options.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
     - `-o, --hole`: Assigns the first available IP address hole in the range rather than the next sequential IP.
 
   - **Examples:**
@@ -264,6 +270,7 @@ Each command has its own set of subcommands and options.
     - `-m, --make_project`: Create the project if it does not exist on the specified remote.
     - `-o, --hole`: Assigns the first available IP address hole in the range rather than the next sequential IP.
     - `-u, --user`: Specify the username to infer the project and derive the public key for `-k/--key`.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
     - `-k, --key`: Add the user's public key to the instance's `authorized_keys` file. Requires `-u/--user`.
     - `-l, --login`: Specify the user login name on the instance for which the key provides access (optional, default: `ubuntu`).
 
@@ -294,6 +301,7 @@ Each command has its own set of subcommands and options.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
 
   - **Examples:**
 
@@ -323,6 +331,7 @@ Each command has its own set of subcommands and options.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
 
   - **Examples:**
 

@@ -4821,13 +4821,18 @@ def create_instance_parser(subparsers):
     )
     instance_subparsers = instance_parser.add_subparsers(dest="instance_command")
 
-    # Add common options for remote, project, and user
+    # Add common options for remote, project, user, and relax mode
     def add_common_arguments(parser):
         parser.add_argument("-r", "--remote", help="Specify the remote server name")
         parser.add_argument("-p", "--project", help="Specify the project name")
         parser.add_argument(
             "-u", "--user",
-            help="Specify the username to infer the project. Relevant for commands such as list, start, stop, and set_key."
+            help="Specify the username to infer the project and the key file name. Relevant for commands such as list, start, stop, and set_key."
+        )
+        parser.add_argument(
+            "-x", "--relax",
+            action="store_true",
+            help="Avoid inferring the project from the user argument. The user is only used to derive the key file."
         )
 
     # Add common options for IP, gateway, and NIC
@@ -4927,7 +4932,10 @@ def create_instance_parser(subparsers):
         description="Set a public key for a user in a specific instance.\n"
                     "The instance name can include remote and project scope in the format 'remote:project.instance_name'.\n"
                     "If the scope is not provided in the instance name, the -r/--remote and -p/--project options can be used.\n"
-                    "If the filename is not provided, the system uses a default based on the -u/--user parameter.",
+                    "If the filename is not provided and the -u/--user option is provided,\n"
+                    "the public key is derived from the user's default key location.\n"
+                    "By default, the project is inferred from the user, but this behavior can be overridden using the -x/--relax option,\n"
+                    "which skips the consistency check between the user and project and only uses the user to determine the key file",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
             "  figo instance set_key instance_name\n"
@@ -5194,7 +5202,7 @@ def handle_instance_command(args, parser_dict):
         return
 
     def parse_instance_scope_for_all(instance_name, provided_remote, provided_project):
-        """Parse the instance name to extract remote, project, and instance for the '--all' option."""
+        """Parse the instance name to extract remote, project, and instance for the '--all' option of the stop command."""
         remote, project, instance = None, None, instance_name  # Default to None
 
         if ':' in instance_name:
@@ -5289,10 +5297,11 @@ def handle_instance_command(args, parser_dict):
         user_project = None
         
         if 'user' in args and args.user:
-            # Handle project based on user if provided
-            user_project = derive_project_from_user(args.user)
             # Store the provided user for later use
             provided_user = args.user
+            if not args.relax:
+                # Handle project based on user if provided
+                user_project = derive_project_from_user(args.user)
 
         # If user_project is set, check for conflicts
         if user_project:
