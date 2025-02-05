@@ -2935,7 +2935,13 @@ def get_wg_client_ip_address(ip_next=False):
     Look for IP addresses assigned to WireGuard clients in the .conf files in the USER_DIR directory.
     If no IP addresses are found, start from BASE_IP_FOR_WG_VPN.
 
+    Returns: 
+    - str: The next available IP address for a WireGuard client
+    - None if an error occurs
+
     """
+    #TODO maybe this function could return None in same more cases
+    #TODO maybe this function could return None if the maximum number of clients is reached
 
     # List to contain the IP addresses found in .conf files
     ip_addresses = []
@@ -2967,14 +2973,26 @@ def get_wg_client_ip_address(ip_next=False):
     else:
         # Find the first available hole in the IP address range
         next_ip = None
+        skip=0
+        previous_ip = None #Used to check if there are duplicate addresses
+
         for i, ip in enumerate(ip_addresses):
-            if ip != ipaddress.ip_address(BASE_IP_FOR_WG_VPN) + i:
-                next_ip = ipaddress.ip_address(BASE_IP_FOR_WG_VPN) + i
+            if previous_ip == ip:
+                logger.error(f"Duplicate address detected : {ip}")
+                return None
+            previous_ip = ip
+            if ip < ipaddress.ip_address(BASE_IP_FOR_WG_VPN):
+                skip += 1
+                continue
+            if ip != ipaddress.ip_address(BASE_IP_FOR_WG_VPN) + i - skip:
+                next_ip = ipaddress.ip_address(BASE_IP_FOR_WG_VPN) + i - skip
                 break
         if next_ip == None:
             # If no holes are found, use the next IP address after the last one
             last_ip = ip_addresses[-1]
             next_ip = last_ip + 1
+            if next_ip < ipaddress.ip_address(BASE_IP_FOR_WG_VPN):
+                next_ip = ipaddress.ip_address(BASE_IP_FOR_WG_VPN)
     return str(next_ip)
 
 def generate_wireguard_config(username, ip_address=None, ip_next=False):
@@ -2995,6 +3013,9 @@ def generate_wireguard_config(username, ip_address=None, ip_next=False):
         # If no IP address is provided, generate a new one
         if not ip_address:
             ip_address = get_wg_client_ip_address(ip_next=ip_next)
+            if ip_address is None:
+                logger.error("Failed to generate IP address for WireGuard client.")
+                return None, None
 
         # Generate the private and public keys using wg
         key_file = f"{username}.tempkey"
