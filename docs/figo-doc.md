@@ -3,7 +3,7 @@
 ## Presentations, Papers, and Documentation
 
 - **FIGO Federated Infrastructure for GPU Orchestration (slideset)**  
-  Stefano Salsano, A. Mayer, P. Lungaroni, L. Bracciale, P. Loreti, A. Detti, M. Orazi  
+  S. Salsano, A. Mayer, P. Lungaroni, L. Bracciale, P. Loreti, A. Detti, M. Orazi  
   INW 2025 - 21st Italian Networking Workshop, Moena (TN), Jan. 20-22  
   [📄 Download PDF](./salsano-figo-moena-25-v02.pdf)
 
