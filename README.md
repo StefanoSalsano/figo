@@ -2,9 +2,11 @@
 
 FIGO is a tool for managing federated testbeds with CPUs and GPUs. It provides commands to handle instances (VMs and containers) and GPU profiles.
 
+Additional presentations, papers, and documentation can be found [here](docs/figo-doc.md).
+
 End user manual (installation and usage) is available [here](https://figo-testbed.readthedocs.io/).
 
-The source code of the documentation site is [here](https://github.com/netgroup/figo-testbed).
+The source code of the end user manual is [here](https://github.com/netgroup/figo-testbed).
 
 ## Usage (for administrators)
 
