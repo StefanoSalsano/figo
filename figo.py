@@ -39,6 +39,9 @@ SSH_LINUX_USER_NAME = "ubuntu"  # Default SSH username for remote Linux hosts
 SSH_LINUX_HOST = ""  # Default Linux IP or host
 SSH_LINUX_PORT = 22  # Default SSH port
 
+# Define the SSH key file suffix
+SSH_KEY_FILE_SUFFIX = "key_ssh_ed25519"  # Default SSH key file suffix
+
 # Define a global dictionary for target lookups
 ACCESS_ROUTER_TARGETS = {
     "mikrotik-rm2": (SSH_MIKROTIK_HOST, SSH_MIKROTIK_USER_NAME, SSH_MIKROTIK_PORT),
@@ -417,7 +420,7 @@ def clear_l2_ip_address_list(instance_object):
     try:
         instance_object.config['user.l2_ip_list'] = ''
         instance_object.save(wait=True)
-        print("All IP addresses cleared from l2 IP address list.")
+        logger.info("All IP addresses cleared from l2 IP address list.")
         return True
     except Exception as e:
         logger.error(f"Error clearing l2 IP address list: {e}")
@@ -669,7 +672,7 @@ def get_ip_device_pairs(instance):
         network_config = instance.get("config", {}).get("user.network-config", "N/A")
 
         # Output the network config for debugging purposes
-        #print(f"Instance '{name}' network config: {network_config}")
+        #logger.info(f"Instance '{name}' network config: {network_config}")
         #TODO (nice to have) reformat the network config to be more readable
 
         ip_device_pairs = []  # List to hold (ip_address, device) pairs
@@ -1696,7 +1699,7 @@ def add_authorized_keys_to_config(config, key_filename, login):
                 groups: [adm, audio, cdrom, dialout, dip, floppy, lxd, netdev, plugdev, sudo, video]
                 sudo: ["ALL=(ALL) NOPASSWD:ALL"]
             """
-            print(f"Added public key content from '{key_filename}' to the config for user '{login}'.")
+            logger.info(f"Added public key content from '{key_filename}' to the config for user '{login}'.")
         except Exception as e:
             raise ValueError(f"Failed to add public key to config: {e}")
     
@@ -2296,7 +2299,7 @@ def show_gpu_pci_addresses(remote='local'):
     try:
         logger.info(f"Getting PCI addresses of GPUs on remote '{remote}'...")
 
-        print (get_pci_addresses(remote))
+        logger.info (get_pci_addresses(remote))
         
         return True
     
@@ -2394,7 +2397,7 @@ def show_profile(remote, project, profile_name):
             'config': profile.config,
             'devices': profile.devices
         }
-        print(yaml.dump(profile_data, default_flow_style=False))
+        logger.info(yaml.dump(profile_data, default_flow_style=False))
     except pylxd.exceptions.NotFound:
         logger.error(f"Profile '{profile_name}' not found in project '{project}' on remote '{remote}'.")
         return False
@@ -3778,7 +3781,7 @@ def add_user(
     # Optionally generate additional SSH key pair if `keys` flag is set
     if keys:
         # Generate Ed25519 key pair for SSH login
-        ssh_key_file = os.path.join(directory, f"{user_name}.key_ssh_ed25519")
+        ssh_key_file = os.path.join(directory, f"{user_name}.{SSH_KEY_FILE_SUFFIX}")
         if not generate_ssh_key_pair(user_name, ssh_key_file, email=email):
             logger.error(f"Failed to generate SSH key pair for user: {user_name}")
             return False
@@ -4725,6 +4728,117 @@ def add_route_on_vpn_access(dst_address, gateway, dev, device_type='mikrotik', u
     else:
         logger.error(f"Unsupported device type: {device_type}")
         return False
+
+#############################################
+###### figo storage command functions #######
+############################################# 
+
+# Placeholder implementations (to be filled in)
+def storage_enroll(args):
+    logger.info(f"[STORAGE] Enrolling {args.fileserver_name} ({args.ip_address}) as {args.backend_fs}, \
+user={args.ssh_user}, mount={args.mount_path}, pool={args.pool_name}")
+
+def storage_delete(args):
+    logger.info(f"[STORAGE] Deleting fileserver {args.fileserver_name}")
+
+def storage_list():
+    logger.info("[STORAGE] Listing fileservers")
+
+
+from pathlib import Path
+from io import StringIO
+
+STORAGE_REGISTRY_PATH = "storage/servers.yaml"
+
+def storage_set_quota(args):
+    logger.info(f"[STORAGE] Setting quota {args.quota_size} for user {args.user} on {args.fileserver_name}")
+    username = args.user
+    quota = args.quota_size
+    fileserver_name = args.fileserver_name
+
+    # Load file server registry from YAML
+    with open(STORAGE_REGISTRY_PATH, "r") as f:
+        registry = yaml.safe_load(f)
+    server_info = registry["fileservers"].get(fileserver_name)
+    if not server_info:
+        raise ValueError(f"Fileserver '{fileserver_name}' not found in registry.")
+
+    mountpoint = server_info["mount_path"]
+    poolname = server_info["pool_name"]
+    fileserver_ip = server_info["ip"]
+    ssh_user = server_info["ssh_user"]
+    dataset = f"{poolname}/{username}"
+    mountfolder = f"{mountpoint}/{username}"
+
+    key_src = Path("users") / f"{username}.{SSH_KEY_FILE_SUFFIX}.pub"
+    if not key_src.exists():
+        raise FileNotFoundError(f"Missing key file: {key_src}")
+
+    with paramiko.SSHClient() as ssh:
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(hostname=fileserver_ip, username=ssh_user)
+
+        def run(cmd):
+            logger.info(f"[REMOTE CMD] {cmd}")
+            stdin, stdout, stderr = ssh.exec_command(cmd)
+            out = stdout.read().decode()
+            err = stderr.read().decode()
+            if stdout.channel.recv_exit_status() != 0:
+                raise RuntimeError(f"Command failed: {cmd}\n{err}")
+            return out
+
+        try:
+            # Check if dataset exists
+            result = ssh.exec_command(f"zfs list {dataset}")[1].channel.recv_exit_status()
+            if result != 0:
+                run(f"sudo zfs create {dataset}")
+
+            # Set quota
+            run(f"sudo zfs set quota={quota} {dataset}")
+
+            # Create system user if not exists
+            run(f"id -u {username} || sudo useradd -M -s /usr/sbin/nologin {username}")
+
+            # Create data directory
+            run(f"sudo mkdir -p {mountfolder}/data")
+
+            # Set ownership
+            run(f"sudo chown {username}:{username} {mountfolder}/data")
+
+            remote_tmp_path = f"/tmp/{username}"
+            remote_final_path = f"/etc/ssh/authorized_keys/{username}"
+
+            # Copy to /tmp via SFTP
+            sftp = ssh.open_sftp()
+            sftp.put(str(key_src), remote_tmp_path)
+            sftp.close()
+
+            # Move with sudo and set permissions
+            run(f"sudo mv {remote_tmp_path} {remote_final_path}")
+            run(f"sudo chown {username}:{username} {remote_final_path}")
+            run(f"sudo chmod 0600 {remote_final_path}")
+
+            # Write SFTP-only config
+            sftp_conf = f"""Match User {username}
+    ChrootDirectory {mountfolder}
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+"""
+            remote_conf_path = f"/etc/ssh/sshd_config.d/70-{username}-sftp.conf"
+            run(f"echo '{sftp_conf}' > /tmp/70-{username}-sftp.conf")
+            run(f"sudo mv /tmp/70-{username}-sftp.conf {remote_conf_path}")
+            run(f"sudo chown root:root {remote_conf_path}")
+            run(f"sudo chmod 0644 {remote_conf_path}")
+            run("sudo systemctl restart ssh")
+
+            logger.info(f"[OK] Quota set and user configured on remote: {username} -> {quota}")
+
+        except Exception as e:
+            logger.info(f"[ERROR] {e}")
+
+def storage_discard(args):
+    logger.info(f"[STORAGE] Discarding user {args.user} from {args.fileserver_name}")
 
 
 #############################################
@@ -6611,6 +6725,79 @@ def handle_vpn_command(args, parser_dict):
             logger.error("Unknown vpn add command.")
 
 #############################################
+###### figo storage command CLI #############
+#############################################
+
+def create_storage_parser(subparsers):
+    storage_parser = subparsers.add_parser(
+        "storage",
+        help="Manage file storage servers and user quotas",
+        description="""
+Manage distributed file storage servers and enforce user quotas.
+
+This command group allows administrators to enroll and remove file servers,
+inspect the current list of registered storage backends, and assign or discard
+user quotas on each of them.
+        """,
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+        "  figo storage enroll myfs1 192.168.1.10 --ssh-user ubuntu --mount-path /mnt/storage --pool-name storage --backend-fs zfs\n"
+        "  figo storage delete myfs1\n"
+        "  figo storage list\n"
+        "  figo storage quota 100G alice myfs1\n"
+        "  figo storage discard alice myfs1\n"
+        "\n"
+        "Use 'figo storage <subcommand> -h' for more detailed help on a specific subcommand.\n"
+    )
+    storage_subparsers = storage_parser.add_subparsers(dest="storage_command")
+
+    # figo storage enroll
+    enroll_parser = storage_subparsers.add_parser("enroll", help="Enroll a new file storage server")
+    enroll_parser.add_argument("fileserver_name", help="Name of the storage server")
+    enroll_parser.add_argument("ip_address", help="IP address of the server")
+    enroll_parser.add_argument("--ssh-user", default="ubuntu", help="SSH username (default: ubuntu)")
+    enroll_parser.add_argument("--mount-path", default="/figo-users-datapool/", help="Path where the storage is mounted")
+    enroll_parser.add_argument("--pool-name", default="figo-users-datapool", help="Name of the ZFS storage pool")
+    enroll_parser.add_argument("--backend-fs", default="zfs", choices=["zfs", "xfs", "ext4"], help="Filesystem type")
+
+    # figo storage delete
+    delete_parser = storage_subparsers.add_parser("delete", help="Remove a file storage server")
+    delete_parser.add_argument("fileserver_name", help="Name of the storage server")
+
+    # figo storage list
+    list_parser = storage_subparsers.add_parser("list", help="List current file storage servers")
+
+    # figo storage quota
+    quota_parser = storage_subparsers.add_parser("quota", help="Set a quota for a user on a file server")
+    quota_parser.add_argument("quota_size", help="Quota size (e.g., 100G)")
+    quota_parser.add_argument("user", help="Username")
+    quota_parser.add_argument("fileserver_name", help="Target file server")
+
+    # figo storage discard
+    discard_parser = storage_subparsers.add_parser("discard", help="Remove a user's quota and delete the user")
+    discard_parser.add_argument("user", help="Username")
+    discard_parser.add_argument("fileserver_name", help="Target file server")
+
+    return storage_parser
+
+# Dispatch function for storage command
+def handle_storage_command(args, parser_dict):
+    if args.storage_command is None:
+        parser_dict["storage_parser"].print_help()
+        return
+
+    if args.storage_command == "enroll":
+        storage_enroll(args)
+    elif args.storage_command == "delete":
+        storage_delete(args)
+    elif args.storage_command == "list":
+        storage_list()
+    elif args.storage_command == "quota":
+        storage_set_quota(args)
+    elif args.storage_command == "discard":
+        storage_discard(args)
+
+#############################################
 ###### figo main functions
 #############################################
 
@@ -6632,6 +6819,7 @@ def create_parser():
     parser_dict['project_parser'] = create_project_parser(subparsers)
     parser_dict['operation_parser'] = create_operation_parser(subparsers)
     parser_dict['vpn_parser'] = create_vpn_parser(subparsers)
+    parser_dict['storage_parser'] = create_storage_parser(subparsers)
 
     return parser, parser_dict
 
@@ -6639,7 +6827,7 @@ def handle_command(args, parser, parser_dict):
 
     # if --version is provided, print the version and exit
     if hasattr(args, 'version'):
-        print(parser.prog, parser.version)  # prints the version of the parser
+        logger.info(parser.prog, parser.version)  # prints the version of the parser
         return
     
     # Handle the command based on the subparser
@@ -6659,6 +6847,9 @@ def handle_command(args, parser, parser_dict):
         handle_operation_command(args, parser_dict)
     elif args.command in ["vpn"]:
         handle_vpn_command(args, parser_dict)
+    elif args.command in ["storage"]:
+        handle_storage_command(args, parser_dict)
+
 
 def main():
     parser, parser_dict = create_parser()
