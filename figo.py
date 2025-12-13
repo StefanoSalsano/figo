@@ -49,6 +49,9 @@ ACCESS_ROUTER_TARGETS = {
     # Add more targets as needed
 }
 
+CONTROLLER_CLIENT_CERT_FILE = "/home/ubuntu/.config/incus/client.crt"  # Controller client certificate file
+CONTROLLER_CLIENT_KEY_FILE = "/home/ubuntu/.config/incus/client.key"  # Controller client key file
+
 VPN_DEVICE_TYPES = ["mikrotik","linux"]  # Extendable list of VPN device types
 DEFAULT_SSH_USER_FOR_VPN_AR = None  # Default SSH username for VPN access routers, default to None if user not provided
 DEFAULT_SSH_PORT_FOR_VPN_AR = None  # Default SSH port for VPN access routers, default to None if port not provided
@@ -512,7 +515,9 @@ def get_remote_client(remote_node, project_name='default', raise_project_not_fou
 
         # Create a pylxd.Client instance with SSL verification
         try:
-            client_instance = pylxd.Client(endpoint=address, verify=cert_path, project=project_name)
+            client_instance = pylxd.Client(endpoint=address, verify=cert_path,
+                                           cert=(CONTROLLER_CLIENT_CERT_FILE, CONTROLLER_CLIENT_KEY_FILE),
+                                           project=project_name)
             if test_project:
                 # Test if the project exist by fetching a non-existent instance
                 try:
