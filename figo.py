@@ -41,6 +41,7 @@ SSH_LINUX_PORT = 22  # Default SSH port
 
 # Define the SSH key file suffix
 SSH_KEY_FILE_SUFFIX = "key_ssh_ed25519"  # Default SSH key file suffix
+SSHFS_KEY_FILE_SUFFIX = "key_sshfs_ed25519"  # SSHFS compatible SSH key file suffix
 
 # Define a global dictionary for target lookups
 ACCESS_ROUTER_TARGETS = {
@@ -112,6 +113,12 @@ DEFAULT_PROFILES_TO_TRANSFER = ["compute-large", "compute-medium", "compute-smal
                                 "disk-128GB", "disk-64GB",
                                 "ssh-deploy"]
 
+# ip addresses to instances are assigned as follows:
+# the network is of size /25
+# the gateway is .129
+# the base ip is .150 for addresses assigned to instances by figo ipam
+# the addresses from .130 to .134 are reserved for static assignment outside figo ipam    
+# the addresses from .135 to .149 are assigned by DHCP server outside figo ipam
 REMOTE_TO_IP_INFO_MAP = {
     "local": {
         "gw": "10.202.8.129",
@@ -134,11 +141,15 @@ REMOTE_TO_IP_INFO_MAP = {
         "prefix_len": 25,
         "base_ip": "10.202.9.150"
         },
-    "l1-gpuserv-l0-local":  {
+    "jeeg":  {
         "ssh_user": "ubuntu",
         "ssh_port": 22,
-        "ssh_host": "10.202.8.208",        
+        "ssh_host": "10.202.8.130",        
+        "gw": "10.202.8.129",
+        "prefix_len": 25,
+        "base_ip": "10.202.8.150"
         }, 
+
 }
 
 # Set up logging
@@ -1663,7 +1674,110 @@ def get_ip_and_gw(ip_address_and_prefix_len, gw_address, remote, mode="next"):
 
     return ip_address_with_prefix, gw_address
 
-def add_authorized_keys_to_config(config, key_filename, login):
+def add_user_data_config_info(config, login_pubkey_filename, ssh_prikey_filename, login, sshfs_user_name):
+    """
+    Adds 'user.user-data' to the config as valid cloud-init YAML.
+    """
+    try:
+
+        public_key_content = None
+        if login_pubkey_filename:
+            if not os.path.isfile(login_pubkey_filename):
+                raise FileNotFoundError(f"Login public key file '{login_pubkey_filename}' does not exist.")
+            with open(login_pubkey_filename, "r") as key_file:
+                public_key_content = key_file.read().strip()
+
+        ssh_private_key_content = None
+        if ssh_prikey_filename:
+            if not os.path.isfile(ssh_prikey_filename):
+                raise FileNotFoundError(f"SSH private key file '{ssh_prikey_filename}' does not exist.")
+            with open(ssh_prikey_filename, "r") as prikey_file:
+                ssh_private_key_content = prikey_file.read().rstrip("\n")
+
+        # --- build cloud-init structure ---
+        user_entry = {
+            "name": login,
+            "shell": "/bin/bash",
+            "lock_passwd": True,
+            "gecos": "Ubuntu",
+            "groups": ["adm", "audio", "cdrom", "dialout", "dip", "floppy", "lxd", "netdev",
+                       "plugdev", "sudo", "video"],
+            "sudo": ['ALL=(ALL) NOPASSWD:ALL'],
+        }
+        if public_key_content:
+            user_entry["ssh-authorized-keys"] = [public_key_content]
+
+        cloud_cfg = {
+            "users": [user_entry],
+        }
+
+        # Only add sshfs-related parts if ssh_prikey_filename is provided
+        if ssh_private_key_content:
+            cloud_cfg["packages"] = ["sshfs"]
+
+            # runcmd supports both strings and lists; we use strings for readability.
+            cloud_cfg["runcmd"] = [
+                'echo "10.202.9.201 file-server" >> /etc/hosts',
+                'echo "10.202.9.201 file-server" >> /etc/cloud/templates/hosts.debian.tmpl',
+                f"mkdir -p /home/{login}/.ssh",
+                # heredoc block
+                "\n".join([
+                    f"cat <<'EOF' > /home/{login}/.ssh/id_ed25519",
+                    ssh_private_key_content,
+                    "EOF",
+                ]),
+                f"chmod 600 /home/{login}/.ssh/id_ed25519",
+                f"chown -R {login}:{login} /home/{login}/.ssh",
+                f"mkdir -p /home/{login}/mnt",
+                f"chown {login}:{login} /home/{login}/mnt",
+                # mount unit creation block
+                "\n".join([
+                    f"U_UID=$(id -u {login})",
+                    f"U_GID=$(id -g {login})",
+                    f'UNIT_FILE="/etc/systemd/system/home-{login}-mnt.mount"',
+                    'cat <<EOF > "$UNIT_FILE"',
+                    "[Unit]",
+                    "Description=SSHFS Mount (Cloud-Init Auto)",
+                    "Requires=network-online.target",
+                    "After=network-online.target",
+                    "",
+                    "[Mount]",
+                    f"What={sshfs_user_name}@file-server:/data",
+                    f"Where=/home/{login}/mnt",
+                    "Type=fuse.sshfs",
+                    "",
+                    "Options=_netdev,allow_other,default_permissions,reconnect,cache=yes,kernel_cache,"
+                    "Compression=no,max_conns=4,ServerAliveInterval=15,ServerAliveCountMax=3,"
+                    "StrictHostKeyChecking=no,Ciphers=aes128-gcm@openssh.com,entry_timeout=60,"
+                    "attr_timeout=60,IdentityFile=/home/{login}/.ssh/id_ed25519,uid=$U_UID,gid=$U_GID"
+                    .replace("{login}", login),
+                    "",
+                    "[Install]",
+                    "WantedBy=multi-user.target",
+                    "EOF",
+                ]),
+                "systemctl daemon-reload",
+                f"systemctl enable --now home-{login}-mnt.mount",
+            ]
+
+        # --- dump as valid cloud-init YAML ---
+        user_data_yaml = "#cloud-config\n" + yaml.safe_dump(
+            cloud_cfg,
+            default_flow_style=False,
+            sort_keys=False,
+            indent=2,
+        )
+
+        config["config"]["user.user-data"] = user_data_yaml
+        logger.info(f"Added user.user-data to the config for user '{login}'.")
+
+    except Exception as e:
+        raise Exception(f"Failed to add user.user-data to config: {e}")
+
+    return config
+
+
+def add_authorized_keys_to_config_old(config, key_filename, login):
     """
     Adds 'user.user-data' to the config if key_filename is provided.
 
@@ -1710,10 +1824,13 @@ def add_authorized_keys_to_config(config, key_filename, login):
     
     return config
 
+
 def create_instance(instance_name, image, remote_name, project, instance_type, 
                     ip_address_and_prefix_len=None, gw_address=None, nic_device_name=None,
                     profiles=[], create_project_flag=False, hole=False,
-                    key_filename=None, folder = USER_DIR, login=DEFAULT_LOGIN_FOR_INSTANCES):
+                    login_pubkey_filename=None, sshfs_prikey_filename=None,
+                    folder = USER_DIR, login=DEFAULT_LOGIN_FOR_INSTANCES,
+                    sshfs_user_name=None):
     """Create a new instance from a local or remote image with specified configurations.
 
     It assigns a static IP address and gateway to the instance.
@@ -1731,7 +1848,8 @@ def create_instance(instance_name, image, remote_name, project, instance_type,
     - create_project_flag: If True, create the project if it does not exist.
     - hole: If True, assign the first available hole starting from the base IP address 
       otherwise assign the next IP address after the highest assigned.
-    - key_filename: Filename of the public key to set in the instance, None if no public key is to be set.
+    - login_pubkey_filename: Filename of the public key to set in the instance, None if no public key is to be set.
+    - sshfs_prikey_filename: Filename of the private key to set for SSHFS mounting, None if no private key is to be set.
     - folder: Folder path where the key file is located (default: USER_DIR).
     - login: Login name of the user for which the key is set (default: 'ubuntu').
 
@@ -1879,10 +1997,25 @@ def create_instance(instance_name, image, remote_name, project, instance_type,
             config['type'] = "virtual-machine"
 
         # Add the public key to the configuration
-        if key_filename:
+        login_pubkey_filepath = None
+        if login_pubkey_filename:
             # create the file path
-            key_filepath = os.path.join(folder, key_filename)
-            config = add_authorized_keys_to_config(config, key_filepath, login)
+            login_pubkey_filepath = os.path.join(folder, login_pubkey_filename)
+
+        # Add the SSHFS private key to the configuration
+        sshfs_prikey_filepath = None
+        if sshfs_prikey_filename:
+            # create the file path
+            sshfs_prikey_filepath = os.path.join(folder, sshfs_prikey_filename)
+
+        print ("login_pubkey_filename:", login_pubkey_filename)
+        print ("sshfs_prikey_filename:", sshfs_prikey_filename)
+        
+        config = add_user_data_config_info(config, login_pubkey_filepath, 
+                                            sshfs_prikey_filepath, login, sshfs_user_name)
+
+        print ("AFTER login_pubkey_filename:", login_pubkey_filename)
+        print ("AFTER sshfs_prikey_filename:", sshfs_prikey_filename)                                            
 
         # Create the instance
         instance = remote_client.instances.create(config, wait=True)
@@ -2657,6 +2790,74 @@ def list_profiles(remote, project, profile_name=None, inherited=False, extend=Fa
     flush_output(extend=extend)
     if set_of_errored_remotes:
         logger.error(f"Error: Failed connection to remote(s): {', '.join(set_of_errored_remotes)}")
+
+def import_profile(remote, project, profile_name, yaml_file, overwrite=False):
+    """
+    Import a profile from a YAML file into the specified remote/project.
+
+    This is a wrapper around:
+      incus profile create <profile>
+      cat <yaml_file> | incus profile edit <profile>
+
+    Args:
+        remote (str): incus remote (or None)
+        project (str): incus project (or None)
+        profile_name (str): profile name
+        yaml_file (str): path to YAML file
+        overwrite (bool): if True, skip profile creation
+    """
+
+    if not os.path.isfile(yaml_file):
+        logger.error(f"YAML file not found: {yaml_file}")
+        return False
+
+    # Incus scoping:
+    # - Remote is expressed as "<remote>:<profile>" (except "local")
+    # - Project is expressed via "--project <project>"
+    incus_project_args = []
+    if project:
+        incus_project_args = ["--project", project]
+
+    if remote and remote != "local":
+        scoped_profile = f"{remote}:{profile_name}"
+    else:
+        scoped_profile = profile_name
+
+    if not overwrite:
+        cmd_create = ["incus"] + incus_project_args + ["profile", "create", scoped_profile]
+
+        logger.debug("Running: %s", " ".join(cmd_create))
+        result = subprocess.run(
+            cmd_create,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if result.returncode != 0:
+            # If profile already exists, continue
+            if "already exists" not in result.stderr.lower():
+                logger.error(result.stderr.strip())
+                return False
+
+    cmd_edit = ["incus"] + incus_project_args + ["profile", "edit", scoped_profile]
+
+    logger.debug("Running: %s < %s", " ".join(cmd_edit), yaml_file)
+
+    with open(yaml_file, "r") as f:
+        result = subprocess.run(
+            cmd_edit,
+            stdin=f,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+    if result.returncode != 0:
+        logger.error(result.stderr.strip())
+        return False
+
+    return True
 
 def copy_profile(source_remote, source_project, source_profile, target_remote, target_project, target_profile):
     """Copy a profile from one location to another with error handling, including the description.
@@ -3673,7 +3874,8 @@ def add_user(
     email=None,
     name=None,
     org=None,
-    keys=False,   
+    keys=False,
+    sshfs_keys=False,   
 ):
     """
     Add a user to Incus with a certificate and optionally generate an additional SSH key pair.
@@ -3695,12 +3897,14 @@ def add_user(
     - name (str, optional): Name of the user.
     - org (str, optional): Organization of the user.
     - keys (bool, optional): If True, generate an additional Ed25519 SSH key pair for the user.
+    - sshfs_keys (bool, optional): If True, generate SSHFS compatible SSH key pair for the user.
 
     This function performs the following steps:
     1. Check if the user already exists in the certificates.
     2. Check if the project exists on the remote server.
     3. Generate a new key pair and certificate if cert_file is not provided.
     4. Optionally generate an additional SSH key pair.
+    4.1. Optionally generate an SSHFS compatible SSH key pair.
     5. Create a project for the user if not an admin and project is not provided.
     6. Add the user certificate to Incus.
     7. Generate WireGuard configuration if wireguard is True, assigning a new IP address.
@@ -3789,6 +3993,14 @@ def add_user(
         ssh_key_file = os.path.join(directory, f"{user_name}.{SSH_KEY_FILE_SUFFIX}")
         if not generate_ssh_key_pair(user_name, ssh_key_file, email=email):
             logger.error(f"Failed to generate SSH key pair for user: {user_name}")
+            return False
+
+    # Optionally generate SSHFS compatible SSH key pair if `sshfs_keys` flag is set
+    if sshfs_keys:
+        # Generate RSA key pair for SSHFS login
+        sshfs_key_file = os.path.join(directory, f"{user_name}.{SSHFS_KEY_FILE_SUFFIX}")
+        if not generate_ssh_key_pair(user_name, sshfs_key_file, email=email):
+            logger.error(f"Failed to generate SSHFS key pair for user: {user_name}")
             return False
 
     # Create a project for the user in the main server (local)
@@ -4741,13 +4953,13 @@ def add_route_on_vpn_access(dst_address, gateway, dev, device_type='mikrotik', u
 # Placeholder implementations (to be filled in)
 def storage_enroll(args):
     logger.info(f"[STORAGE] Enrolling {args.fileserver_name} ({args.ip_address}) as {args.backend_fs}, \
-user={args.ssh_user}, mount={args.mount_path}, pool={args.pool_name}")
+user={args.ssh_user}, mount={args.mount_path}, pool={args.pool_name} - NOT IMPLEMENTED YET")
 
 def storage_delete(args):
-    logger.info(f"[STORAGE] Deleting fileserver {args.fileserver_name}")
+    logger.info(f"[STORAGE] Deleting fileserver {args.fileserver_name} - NOT IMPLEMENTED YET")
 
 def storage_list():
-    logger.info("[STORAGE] Listing fileservers")
+    logger.info("[STORAGE] Listing fileservers - NOT IMPLEMENTED YET")   
 
 
 from pathlib import Path
@@ -4775,7 +4987,7 @@ def storage_set_quota(args):
     dataset = f"{poolname}/{username}"
     mountfolder = f"{mountpoint}/{username}"
 
-    key_src = Path("users") / f"{username}.{SSH_KEY_FILE_SUFFIX}.pub"
+    key_src = Path("users") / f"{username}.{SSHFS_KEY_FILE_SUFFIX}.pub"
     if not key_src.exists():
         raise FileNotFoundError(f"Missing key file: {key_src}")
 
@@ -5194,6 +5406,7 @@ def create_instance_parser(subparsers):
             "  figo instance create instance_name image_name -f profile1,profile2\n"
             "  figo instance create instance_name image_name -m --hole\n"
             "  figo instance create instance_name image_name -u user -k\n"
+            "  figo instance create instance_name image_name -u user -s\n"
             "  figo instance create instance_name image_name -u user -k -l newlogin"
     )
     create_parser.add_argument(
@@ -5226,6 +5439,15 @@ def create_instance_parser(subparsers):
         "-k", "--key",
         action="store_true",
         help="Add the user's public key to the instance's authorized_keys file. Requires -u/--user."
+    )
+    create_parser.add_argument(
+        "-s", "--storage",
+        action="store_true",
+        help=(
+        "Enable predefined per-user external storage via SSHFS automount at creation time.\n"
+        "Mount definitions are taken from figo configuration variables and the required SSH private key\n"
+        "is injected into the instance during creation."
+        )
     )
     create_parser.add_argument(
         "-l", "--login",
@@ -5404,15 +5626,41 @@ def handle_instance_command(args, parser_dict):
             return f"images:{image_name}"
 
     def derive_pub_key_from_user(user, folder):
-        """Derive the public key filename from the user."""
+        """Derive the non-SSHFS public key filename from the user."""
 
-        #list all files that starts with 'user.' and ends with '.pub' in the folder
-        files = [f for f in os.listdir(folder) if f.startswith(f"{user}.") and f.endswith(".pub")]
+        # list all files that start with '<user>', end with '.pub' and do NOT contain 'sshfs'
+        files = [
+            f for f in os.listdir(folder)
+            if f.startswith(f"{user}")
+            and f.endswith(".pub")
+            and "sshfs" not in f
+        ]
+
         if len(files) == 0:
             logger.error(f"Error: No public key file found for user '{user}'.")
             return None
         elif len(files) > 1:
             logger.error(f"Error: Multiple public key files found for user '{user}'.")
+            return None
+        else:
+            return files[0]
+
+    def derive_priv_sshfs_key_from_user(user, folder):
+        """Derive the private SSHFS key filename from the user."""
+
+        # list all files that start with '<user>', contain 'sshfs' and do not end with '.pub'
+        files = [
+            f for f in os.listdir(folder)
+            if f.startswith(f"{user}")
+            and "sshfs" in f
+            and not f.endswith(".pub")
+        ]
+
+        if len(files) == 0:
+            logger.error(f"Error: No SSHFS private key file found for user '{user}'.")
+            return None
+        elif len(files) > 1:
+            logger.error(f"Error: Multiple SSHFS private key files found for user '{user}'.")
             return None
         else:
             return files[0]
@@ -5541,8 +5789,17 @@ def handle_instance_command(args, parser_dict):
                     if not args.user:
                         logger.error("Error: -k/--key requires -u/--user to specify the public key owner.")
                         return
-                    my_key_filename = derive_pub_key_from_user(args.user, USER_DIR) 
-                    if my_key_filename is None:
+                    my_pubkey_filename = derive_pub_key_from_user(args.user, USER_DIR) 
+                    if my_pubkey_filename is None:
+                        return
+
+                if args.storage:
+                    if not args.user:
+                        logger.error("Error: -s/--storage requires -u/--user to specify the storage owner.")
+                        return
+                    my_sshfs_key_filename = derive_priv_sshfs_key_from_user(args.user, USER_DIR)
+                    if my_sshfs_key_filename is None:
+                        logger.error("Error: Cannot proceed without a valid SSHFS private key file.")
                         return
 
                 image = parse_image(args.image)
@@ -5560,7 +5817,9 @@ def handle_instance_command(args, parser_dict):
                 create_instance(instance, image, remote, project, instance_type,
                                 ip_address_and_prefix_len=args.ip, gw_address=args.gw, nic_device_name=args.nic,
                                 profiles=profiles, create_project_flag=args.make_project, hole=args.hole,
-                                key_filename=my_key_filename if args.key else None, folder = USER_DIR, login=args.login)
+                                login_pubkey_filename=my_pubkey_filename if args.key else None,
+                                sshfs_prikey_filename=my_sshfs_key_filename if args.storage else None,
+                                folder = USER_DIR, login=args.login, sshfs_user_name=args.user)
             elif args.instance_command in ["delete", "del", "d"]:
                 delete_instance(instance, remote, project, force=args.force)
             elif args.instance_command in ["bash", "b"]:
@@ -5879,6 +6138,36 @@ def create_profile_parser(subparsers):
         help="Name of the profile to dump. If omitted, use the --all option to dump all profiles."
     )
 
+    # Import command
+    import_parser = profile_subparsers.add_parser(
+        "import",
+        help="Import a profile from a YAML file.",
+        description="Import a profile from a YAML file into Incus.\n"
+                    "Wrapper for:\n"
+                    "  incus profile create <profile>\n"
+                    "  cat <yaml> | incus profile edit <profile>\n"
+                    "The profile name can include remote/project scope.\n",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo profile import my_profile profiles/my_profile.yaml\n"
+               "  figo profile import remote:project.my_profile profiles/my_profile.yaml\n"
+               "  figo profile import my_profile profiles/my_profile.yaml --overwrite\n"
+    )
+    import_parser.add_argument(
+        "profile_name",
+        help="Target profile name. Can include remote and project scope (e.g., remote:project.profile)."
+    )
+    import_parser.add_argument(
+        "yaml_file",
+        help="Path to the profile YAML file to import."
+    )
+    import_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Skip 'incus profile create' and directly edit the profile from YAML."
+    )
+
+
     # List command
     list_parser = profile_subparsers.add_parser(
         "list",
@@ -5973,6 +6262,8 @@ def create_profile_parser(subparsers):
         help="List the default profiles that would be transferred during initialization. If this option is used, the remote cannot be specified."
     )
 
+    return profile_parser
+
 def parse_profile_scope(profile_scope, assign_defaults=True):
     """Parse a profile scope string and return remote, project, and profile names.
 
@@ -6066,6 +6357,19 @@ def handle_profile_command(args, parser_dict):
         remote, project, profile = parse_profile_scope(args.scope, assign_defaults=False)
         list_profiles(remote, project, profile_name=profile, inherited=args.inherited,
                       extend=args.extend, recurse_instances=args.recurse_instances)
+    elif args.profile_command == "import":
+        remote, project, profile = parse_profile_scope(args.profile_name)
+        if profile is None or profile == "":
+            logger.error("Error: Profile name cannot be empty.")
+            return
+        import_profile(
+            remote,
+            project,
+            profile,
+            args.yaml_file,
+            overwrite=args.overwrite
+        )
+
     elif args.profile_command == "copy":
         source_remote, source_project, source_profile = parse_profile_scope(args.source_profile)
         target_remote, target_project, target_profile = parse_profile_scope(
@@ -6173,6 +6477,7 @@ def create_user_parser(subparsers):
 
     # Add subcommand
     user_add_parser = user_subparsers.add_parser("add", aliases=["a"], help="Add a new user to the system",
+                                                description="Add a new user to the system with various options for access and configuration.",
                                                  formatter_class=argparse.RawTextHelpFormatter)
     user_add_parser.add_argument("username", action=NoUnderscoreCheck, help="Username of the new user")
     user_add_parser.add_argument("-c", "--cert",
@@ -6193,6 +6498,7 @@ def create_user_parser(subparsers):
     user_add_parser.add_argument("-n", "--name", action=NoCommaCheck, help="User's full name")
     user_add_parser.add_argument("-o", "--org", action=NoCommaCheck, help="User's organization")
     user_add_parser.add_argument("-k", "--keys", action="store_true", help="Generate a key pair for SSH access to instances")
+    user_add_parser.add_argument("-f", "--sshfs_keys", action="store_true", help="Generate a key pair for SSHFS access to instances")
 
     # Grant subcommand
     user_grant_parser = user_subparsers.add_parser("grant", help="Grant a user access to a specific project")
@@ -6237,7 +6543,7 @@ def handle_user_command(args, parser_dict, client_name=None):
             return
         add_user(args.username, args.cert, client, remote_name=client_name, admin=args.admin, wireguard=args.wireguard, 
                 ip_next=args.ip_next, set_vpn=args.set_vpn, project=args.project, email=args.email, name=args.name,
-                org=args.org, keys=args.keys)
+                org=args.org, keys=args.keys, sshfs_keys=args.sshfs_keys)
     elif args.user_command == "grant":
         grant_user_access(args.username, args.projectname, client)
     elif args.user_command == "edit":
