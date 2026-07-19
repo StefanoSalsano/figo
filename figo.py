@@ -2007,15 +2007,9 @@ def create_instance(instance_name, image, remote_name, project, instance_type,
         if sshfs_prikey_filename:
             # create the file path
             sshfs_prikey_filepath = os.path.join(folder, sshfs_prikey_filename)
-
-        print ("login_pubkey_filename:", login_pubkey_filename)
-        print ("sshfs_prikey_filename:", sshfs_prikey_filename)
-        
+       
         config = add_user_data_config_info(config, login_pubkey_filepath, 
                                             sshfs_prikey_filepath, login, sshfs_user_name)
-
-        print ("AFTER login_pubkey_filename:", login_pubkey_filename)
-        print ("AFTER sshfs_prikey_filename:", sshfs_prikey_filename)                                            
 
         # Create the instance
         instance = remote_client.instances.create(config, wait=True)
