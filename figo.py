@@ -1269,10 +1269,8 @@ def start_instance(instance_name, remote, project):
         instance_type = instance.type # can be 'virtual-machine' or 'container'
         if instance_type == "virtual-machine":
             instance_type = "vm"
-            start_prefix = "gpu-vm"
         else:
             instance_type = "container"
-            start_prefix = "gpu-cnt"
 
         #TODO differentiate the following code based on the instance type
 
@@ -1303,35 +1301,6 @@ def start_instance(instance_name, remote, project):
                     f"Not enough available GPUs to start instance '{instance_name}'."
                 )
                 return False
-
-            #TODO (nice to have) check error conditions in the following code
-            # Resolve GPU conflicts
-            conflict = False
-            for gpu_profile in gpu_profiles_for_instance:
-                for my_project, my_instance in running_instances_couple:
-                    if gpu_profile in my_instance.profiles:
-                        conflict = True
-                        logger.warning(
-                            f"GPU profile '{gpu_profile}' is already in use by "
-                            f"instance {my_project}.{my_instance.name}."
-                        )
-                        instance_profiles.remove(gpu_profile)
-                        new_profile = [
-                            p for p in remote_client.profiles.all() 
-                            if p.name.startswith(start_prefix) and p.name not in active_gpu_profiles
-                            and p.name not in instance_profiles
-                        ][0].name
-                        instance_profiles.append(new_profile)
-                        logger.info(
-                            f"Replaced GPU profile '{gpu_profile}' with '{new_profile}' "
-                            f"for instance {project}.{instance_name}"
-                        )
-                        break
-
-            # Update profiles if needed and start the instance
-            if conflict:
-                instance.profiles = instance_profiles
-                instance.save(wait=True)
 
         else: # there are no GPU profiles associated with the instance
             pass
