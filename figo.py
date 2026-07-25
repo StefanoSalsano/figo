@@ -1191,53 +1191,265 @@ def get_pci_addresses (remote):
     return available_pci_addresses
 
 
-def return_available_gpu(remote, instance_type):
-    """
-    Return a list of PCI addresses for GPUs on a given remote based on the specified type.
+# Canonical name of a GPU profile: gpu-vm-N-PCI or gpu-cnt-N-PCI, where N is the
+# 1-based, human-facing index of the card on that remote. The index is read from
+# the name; the PCI address is always read from the device inside the profile,
+# never from the name.
+GPU_PROFILE_NAME_RE = re.compile(r'^gpu-(vm|cnt)-(\d+)-')
 
-    These are the GPUs available on the remote for the instance type:
-    intersection of the visible GPUs with the GPUs in the profiles
-    
+
+def gpu_devices_of(devices):
+    """Return the PCI addresses of the physical GPU devices in a device dictionary.
+
+    'gputype' defaults to 'physical' in Incus, so a device that omits the key is
+    taken as physical rather than skipped. A GPU device with no 'pci' cannot be
+    accounted for and is left out: figo can only reason about cards it can name.
+
     Parameters:
-        remote (str): Name of the remote to check for available GPUs.
-        instance_type (str): Type of GPU profile to check for, either 'vm' or 'container'.
-    
+        devices (dict): a device dictionary, e.g. an instance's expanded_devices
+                        or a profile's devices.
+
     Returns:
-        list: A list of PCI addresses of available GPUs.
+        set: the PCI addresses assigned by those devices.
     """
-    # Determine prefix for profile based on instance type
+    return {
+        device.get('pci') for device in (devices or {}).values()
+        if device.get('type') == 'gpu'
+        and device.get('gputype', 'physical') == 'physical'
+        and device.get('pci')
+    }
+
+
+def gpu_offer(remote, instance_type):
+    """Return the cards a remote offers to an instance type, as {index: pci_address}.
+
+    The offer is declared by the existence of the canonical profiles
+    'gpu-vm-N-PCI' (cards offered to VMs) and 'gpu-cnt-N-PCI' (cards offered to
+    containers): the prefix is the per-card policy, so a card can be offered to
+    VMs, to containers, to both, or to neither. A profile whose name starts with
+    'gpu-' but carries no usable GPU device is reported and left out: on the read
+    path names never carry semantics, devices do.
+
+    Parameters:
+        remote (str): name of the remote.
+        instance_type (str): 'vm' or 'container'.
+
+    Returns:
+        dict: {card index (int): PCI address (str)}.
+    """
     if instance_type == 'vm':
-        profile_prefix = 'gpu-vm'
+        profile_prefix = 'gpu-vm-'
     elif instance_type == 'container':
-        profile_prefix = 'gpu-cnt'
+        profile_prefix = 'gpu-cnt-'
     else:
         raise ValueError("Invalid instance type. Must be 'vm' or 'container'.")
 
-    # Initialize a pylxd client on the remote
     client = get_remote_client(remote)
     if not client:
         logger.error(f"Failed to connect to remote '{remote}'.")
-        return []
+        return {}
 
-    # Get PCI addresses from profiles
-    profile_pci_addresses = []
+    offer = {}
     for profile in client.profiles.all():
-        if profile.name.startswith(profile_prefix):
-            for device in profile.devices.values():
-                if device.get('type') == 'gpu' and device.get('gputype') == 'physical':
-                    pci_address = device.get('pci')
-                    if pci_address:
-                        profile_pci_addresses.append(pci_address)
+        if not profile.name.startswith('gpu-'):
+            continue
 
-    available_pci_addresses = get_pci_addresses(remote)
+        pci_addresses = gpu_devices_of(profile.devices)
+        if not pci_addresses:
+            logger.warning(
+                f"Profile '{profile.name}' on remote '{remote}' is named like a GPU "
+                f"profile but carries no usable GPU device: ignored."
+            )
+            continue
 
-    if available_pci_addresses is None:
-        logger.error(f"Failed to retrieve available PCI addresses from remote '{remote}'.")
-        return []
-    
-    # Find intersection of PCI addresses from profiles and available PCI addresses
-    available_gpus = list(set(profile_pci_addresses) & set(available_pci_addresses))
-    return available_gpus
+        if not profile.name.startswith(profile_prefix):
+            continue
+
+        name_match = GPU_PROFILE_NAME_RE.match(profile.name)
+        if not name_match:
+            logger.warning(
+                f"Profile '{profile.name}' on remote '{remote}' does not follow the "
+                f"'{profile_prefix}N-PCI' convention: the card it assigns cannot be "
+                f"referred to by index."
+            )
+            continue
+
+        if len(pci_addresses) > 1:
+            logger.warning(
+                f"Profile '{profile.name}' on remote '{remote}' assigns more than one "
+                f"GPU ({', '.join(sorted(pci_addresses))}): only canonical one-card "
+                f"profiles are part of the offer."
+            )
+            continue
+
+        card_index = int(name_match.group(2))
+        offer[card_index] = pci_addresses.pop()
+
+    return offer
+
+
+def gpu_holders(remote):
+    """Return which running instances hold which card on a remote.
+
+    Usage is read from the expanded devices of the running instances of every
+    project, so a card counts as held however it was assigned: through a canonical
+    figo profile, through a profile with any other name, or through a device
+    attached directly with 'incus config device add'. Cards are keyed by PCI
+    address, which is local to the remote that enumerates it.
+
+    Instances that are not running hold nothing: figo releases resources on stop.
+
+    Parameters:
+        remote (str): name of the remote.
+
+    Returns:
+        tuple: (vm_holders, container_holders), each a dict
+               {PCI address: [(project name, instance name), ...]}.
+    """
+    vm_holders = {}
+    container_holders = {}
+
+    for project_name, instance in iterator_over_instances(remote):
+        if instance.status != "Running":
+            continue
+
+        holders = vm_holders if instance.type == "virtual-machine" else container_holders
+        for pci_address in gpu_devices_of(instance.expanded_devices):
+            holders.setdefault(pci_address, []).append((project_name, instance.name))
+
+    return vm_holders, container_holders
+
+
+def gpu_start_decision(requested, vm_holders, container_holders, instance_type):
+    """Decide whether a start may proceed, given the cards it wants and their holders.
+
+    Pure function: no client, no I/O. A VM takes a card exclusively, through PCI
+    passthrough, so it is blocked by any holder and blocks everyone in turn; two
+    or more containers share a card by time-slicing, which is normal operation
+    and not an error.
+
+    Parameters:
+        requested (set): PCI addresses the starting instance wants.
+        vm_holders (dict): {PCI address: [(project, name), ...]} held by running VMs.
+        container_holders (dict): the same for running containers.
+        instance_type (str): 'vm' or 'container', the instance being started.
+
+    Returns:
+        tuple: (blocked, shared).
+               blocked is a list of (PCI address, holder kind, holders) that
+               forbid the start, holder kind being 'vm' or 'container'.
+               shared is a list of (PCI address, holders) that the start will
+               share with running containers.
+    """
+    blocked = []
+    shared = []
+
+    for pci_address in sorted(requested):
+        vms = vm_holders.get(pci_address, [])
+        containers = container_holders.get(pci_address, [])
+
+        if vms:
+            # The card is bound to vfio-pci for the VM: it is not there for anyone else.
+            blocked.append((pci_address, 'vm', vms))
+        elif containers and instance_type == 'vm':
+            # Passing the card through would unbind the driver under a live container.
+            blocked.append((pci_address, 'container', containers))
+        elif containers:
+            shared.append((pci_address, containers))
+
+    return blocked, shared
+
+
+def format_instance_list(holders, state=None):
+    """Render a list of (project, instance name) couples for a message.
+
+    'state' is appended to each entry when the state is part of the point being
+    made -- a refusal has to say that the holder is running right now.
+    """
+    suffix = f", {state}" if state else ""
+    return ", ".join(f"'{name}' (project {project}{suffix})" for project, name in holders)
+
+
+def plural_gpus(count):
+    """'1 GPU' / '2 GPUs', because a message that cannot count is not trusted."""
+    return f"{count} GPU" if count == 1 else f"{count} GPUs"
+
+
+def format_gpu_start_refusal(instance_name, scope, remote, instance_type, blocked,
+                             requested_count, free_card_indexes, offer_size,
+                             counterpart_offer_size):
+    """Compose the message of a start refused because of GPU contention.
+
+    Pure function: it receives facts and returns text. A refusal has to tell the
+    administrator three things -- what is in the way, whether there is room
+    elsewhere, and which commands reassign the instance -- otherwise the only
+    available reaction is to try again, which cannot work.
+
+    Parameters:
+        instance_name (str): name of the instance that was to be started.
+        scope (str): the instance in 'remote:project.instance' form, for the commands.
+        remote (str): name of the remote.
+        instance_type (str): 'vm' or 'container', the instance being started.
+        blocked (list): the (PCI address, holder kind, holders) triples from
+                        gpu_start_decision.
+        requested_count (int): how many distinct cards the instance wants.
+        free_card_indexes (list): indexes of the cards free for this instance type.
+        offer_size (int): how many cards the remote offers to this instance type.
+        counterpart_offer_size (int): how many it offers to the other type.
+
+    Returns:
+        str: the multi-line message.
+    """
+    regime = "VMs" if instance_type == 'vm' else "containers"
+    other_regime = "containers" if instance_type == 'vm' else "VMs"
+    profile_prefix = "gpu-vm-*" if instance_type == 'vm' else "gpu-cnt-*"
+
+    reasons = []
+    for pci_address, holder_kind, holders in blocked:
+        if holder_kind == 'vm':
+            reasons.append(
+                f"GPU {pci_address} is held by VM "
+                f"{format_instance_list(holders, state='RUNNING')}"
+            )
+        else:
+            reasons.append(
+                f"GPU {pci_address} is in use by running container(s) "
+                f"{format_instance_list(holders)}"
+            )
+    lines = [f"Cannot start '{instance_name}': " + "; ".join(reasons) + "."]
+
+    if offer_size == 0:
+        supply = (
+            f"No card on '{remote}' is offered to {regime}: no {profile_prefix} profile "
+            f"exists there"
+        )
+        if counterpart_offer_size:
+            supply += f", the {counterpart_offer_size} cards present are offered to {other_regime} only."
+        else:
+            supply += "."
+        lines.append(supply)
+    elif len(free_card_indexes) >= requested_count:
+        lines.append(
+            f"{plural_gpus(len(free_card_indexes))} free for {regime} on '{remote}' "
+            f"(cards {', '.join(str(index) for index in free_card_indexes)}) -- enough for "
+            f"this instance (needs {requested_count})."
+        )
+    else:
+        lines.append(
+            f"Only {plural_gpus(len(free_card_indexes))} free for {regime} on '{remote}' "
+            f"(needs {requested_count}): stop or reassign other instances first."
+        )
+
+    if instance_type == 'vm' and any(kind == 'container' for _, kind, _ in blocked):
+        lines.append(
+            "Passing a card through to a VM would take it away from a running container: "
+            "stop or reassign those containers, retrying will not help."
+        )
+
+    lines.append(f"To reassign:  figo gpu remove {scope} -a")
+    lines.append(f"              figo gpu add {scope}")
+
+    return "\n".join(lines)
 
 
 def start_instance(instance_name, remote, project):
@@ -1272,38 +1484,58 @@ def start_instance(instance_name, remote, project):
         else:
             instance_type = "container"
 
-        #TODO differentiate the following code based on the instance type
+        # Which cards this instance wants, read from its expanded devices: whatever
+        # put the device there -- a canonical profile, any other profile, or a
+        # device attached directly -- the instance will find that card in front of
+        # it. Deduplicated by PCI address: two profiles for the same card are one
+        # card.
+        requested_pci_addresses = gpu_devices_of(instance.expanded_devices)
 
-        # Get GPU profiles associated with this instance
-        instance_profiles = instance.profiles
-        gpu_profiles_for_instance = [
-            profile for profile in instance_profiles if profile.startswith("gpu-")
-        ]
-        
-        if gpu_profiles_for_instance: # there is at least one GPU profile associated with the instance
+        if requested_pci_addresses:
+            vm_holders, container_holders = gpu_holders(remote)
+            blocked, shared = gpu_start_decision(
+                requested_pci_addresses, vm_holders, container_holders, instance_type
+            )
 
-            gpu_list = return_available_gpu(remote, instance_type)
-            # this is the total maximum number of GPUs available on the remote for the instance type
-            # intersection of the visible GPUs and the GPUs in the profiles
-            total_gpus = len(gpu_list)
-
-            running_instances_couple = [
-                i for i in iterator_over_instances(remote) if i[1].status == "Running"
-            ]
-            active_gpu_profiles = [
-                profile for my_profile, my_instance in running_instances_couple for profile in my_instance.profiles
-                if profile.startswith("gpu-")
-            ]
-
-            available_gpus = total_gpus - len(active_gpu_profiles)
-            if len(gpu_profiles_for_instance) > available_gpus:
-                logger.error(
-                    f"Not enough available GPUs to start instance '{instance_name}'."
+            # All or nothing: an instance that cannot get one of its cards is not
+            # started with the others, and every contended card is reported at once
+            # so that the administrator sees the whole picture in one message.
+            if blocked:
+                offer = gpu_offer(remote, instance_type)
+                counterpart_offer = gpu_offer(
+                    remote, 'container' if instance_type == 'vm' else 'vm'
                 )
+                # A card is free for a VM when nobody is running on it; for a
+                # container, when no VM holds it -- other containers may share.
+                free_card_indexes = sorted(
+                    index for index, pci_address in offer.items()
+                    if not vm_holders.get(pci_address)
+                    and (instance_type == 'container' or not container_holders.get(pci_address))
+                )
+                logger.error(format_gpu_start_refusal(
+                    instance_name, f"{remote}:{project}.{instance_name}", remote,
+                    instance_type, blocked, len(requested_pci_addresses),
+                    free_card_indexes, len(offer), len(counterpart_offer),
+                ))
                 return False
 
-        else: # there are no GPU profiles associated with the instance
-            pass
+            for pci_address, containers in shared:
+                logger.info(
+                    f"GPU {pci_address} shared with {len(containers)} running "
+                    f"container(s): {format_instance_list(containers)}."
+                )
+
+            # Physical existence is a warning, never a block. The remote may be
+            # unreachable over ssh or missing from REMOTE_TO_IP_INFO_MAP (every L1
+            # host, today), and refusing to start because we could not verify the
+            # hardware is worse than starting and letting Incus give the verdict.
+            visible_pci_addresses = get_pci_addresses(remote)
+            if visible_pci_addresses is not None:
+                for pci_address in sorted(requested_pci_addresses - set(visible_pci_addresses)):
+                    logger.warning(
+                        f"GPU {pci_address} requested by '{instance_name}' is not visible "
+                        f"on remote '{remote}'."
+                    )
 
         instance.start(wait=True)
         logger.info(f"Instance '{instance_name}' started on '{remote}:{project}'.")
