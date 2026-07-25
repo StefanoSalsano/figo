@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Incus client certificates and keys used by figo at runtime: the working
+# directory of the repository is also figo's working directory on the
+# controller, so these appear here and must never reach the remote.
+certs/
+storage/
+
+# Editor leftovers
+*.swp
+*~
+
+# Note: profiles/ is deliberately NOT ignored. Those YAML files describe the
+# testbed and are versioned on purpose, even though `figo profile dump` writes
+# into the same directory.
