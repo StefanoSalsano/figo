@@ -69,7 +69,7 @@ warnings.filterwarnings("ignore", message="Attempted to set unknown attribute", 
 NET_PROFILE = "net-bridged-br-200-3"
 #NAME_SERVER_IP_ADDR = "160.80.1.8"
 NAME_SERVER_IP_ADDR = "8.8.8.8"
-NAME_SERVER_IP_ADDR_2 = "8.8.8.4"
+NAME_SERVER_IP_ADDR_2 = "8.8.4.4"
 
 PROFILE_DIR = "./profiles"
 USER_DIR = "./users"
