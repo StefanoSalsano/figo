@@ -440,6 +440,174 @@ def clear_l2_ip_address_list(instance_object):
         logger.error(f"Error clearing l2 IP address list: {e}")
         return False
 
+#############################################
+###### additional IP addresses          #####
+#############################################
+# An instance can hold, besides its own address, further addresses of the same subnet:
+# addresses used by nested QEMU virtual machines it runs, by containers started inside it,
+# or simply extra addresses configured on its own NIC. They are recorded here so that the
+# IPAM never hands them out to somebody else. figo records them, it does not configure them.
+#
+# The state lives in the instance configuration, under ADDITIONAL_IPS_KEY, as a YAML list:
+#
+#   - ip: 10.202.9.214
+#     mac: 52:54:00:ca:09:d6
+#     name: gob0
+#   - ip: 10.202.9.215
+#     name: dev-guest
+#
+# This is deliberately NOT the same key as 'user.l2_ip_list' used by L1 hosts: that one is an
+# index of nested *Incus instances* that exist as objects elsewhere, this one is a primary
+# record of addresses about which figo knows nothing else. Both are honoured by the allocator.
+
+ADDITIONAL_IPS_KEY = 'user.figo.additional_ips'
+
+# Prefix used when deriving a MAC address from an IP address (locally administered, QEMU).
+DERIVED_MAC_PREFIX = '52:54:00'
+
+def get_additional_ips_from_config(config):
+    """Return the additional IP entries found in an instance configuration dictionary.
+
+    Accepts the raw config dict, as provided both by 'incus list -f json' and by a pylxd
+    instance object, so that it can be used on the listing path and on the write path alike.
+
+    Returns: a list of dicts with the 'ip' key always present and the 'mac' and 'name' keys
+             possibly None. Returns an empty list when the key is absent, empty or unreadable:
+             a malformed value must not prevent the rest of figo from working.
+    """
+    raw = (config or {}).get(ADDITIONAL_IPS_KEY, '')
+    if not raw or not str(raw).strip():
+        return []
+
+    try:
+        parsed = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing '{ADDITIONAL_IPS_KEY}': {e}")
+        return []
+
+    if not isinstance(parsed, list):
+        logger.error(f"Error: '{ADDITIONAL_IPS_KEY}' does not contain a YAML list.")
+        return []
+
+    entries = []
+    for item in parsed:
+        if isinstance(item, dict) and item.get('ip'):
+            entries.append({
+                'ip': str(item.get('ip')),
+                'mac': str(item.get('mac')) if item.get('mac') else None,
+                'name': str(item.get('name')) if item.get('name') else None,
+            })
+        else:
+            logger.error(f"Error: ignoring malformed entry in '{ADDITIONAL_IPS_KEY}': {item}")
+    return entries
+
+def get_additional_ip_list(instance_object):
+    """Retrieve the additional IP entries of an instance.
+
+    Returns:    A list of entries, or None if there is an error.
+    """
+    try:
+        return get_additional_ips_from_config(instance_object.config)
+    except Exception as e:
+        logger.error(f"Error retrieving additional IP address list: {e}")
+        return None
+
+def _store_additional_ip_list(instance_object, entries):
+    """Serialise the entries and save them on the instance object.
+
+    Keys whose value is None are dropped, so that an entry without MAC or label does not
+    leave empty fields behind in the stored configuration.
+    """
+    if entries:
+        cleaned = [{k: v for k, v in entry.items() if v is not None} for entry in entries]
+        instance_object.config[ADDITIONAL_IPS_KEY] = yaml.safe_dump(
+            cleaned, default_flow_style=False, sort_keys=False)
+    else:
+        # Drop the key altogether rather than leaving an empty value behind, so that an instance
+        # that holds no additional address shows no trace of the feature in 'incus config show'.
+        instance_object.config.pop(ADDITIONAL_IPS_KEY, None)
+    instance_object.save(wait=True)
+
+def add_additional_ip(instance_object, ip_address, mac=None, name=None):
+    """Add an IP address to the additional IP address list of the instance.
+
+    The address is added only if it is not already in the list. Checking that it is not in
+    use elsewhere in the subnet is the caller's responsibility (see handle_instance_additional_ip),
+    because it requires querying the whole remote.
+
+    return: True if the IP address was added, False otherwise.
+    """
+    try:
+        entries = get_additional_ips_from_config(instance_object.config)
+        if any(entry['ip'] == ip_address for entry in entries):
+            logger.error(f"IP address {ip_address} is already in the additional IP address list.")
+            return False
+
+        entries.append({'ip': ip_address, 'mac': mac, 'name': name})
+        _store_additional_ip_list(instance_object, entries)
+        logger.info(f"IP address {ip_address} added to the additional IP address list.")
+        return True
+    except Exception as e:
+        logger.error(f"Error adding IP address to the additional IP address list: {e}")
+        return False
+
+def remove_additional_ip(instance_object, ip_address):
+    """Remove an IP address from the additional IP address list of the instance.
+
+    return: True if the IP address was removed, False otherwise.
+    """
+    try:
+        entries = get_additional_ips_from_config(instance_object.config)
+        remaining = [entry for entry in entries if entry['ip'] != ip_address]
+        if len(remaining) == len(entries):
+            logger.error(f"IP address {ip_address} not found in the additional IP address list.")
+            return False
+
+        _store_additional_ip_list(instance_object, remaining)
+        logger.info(f"IP address {ip_address} removed from the additional IP address list.")
+        return True
+    except Exception as e:
+        logger.error(f"Error removing IP address from the additional IP address list: {e}")
+        return False
+
+def clear_additional_ip_list(instance_object):
+    """Clear all the IP addresses from the additional IP address list of the instance.
+
+    return: True if the IP addresses were cleared, False otherwise.
+    """
+    try:
+        _store_additional_ip_list(instance_object, [])
+        logger.info("All IP addresses cleared from the additional IP address list.")
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing the additional IP address list: {e}")
+        return False
+
+def derive_mac_from_ip(ip_address):
+    """Derive a deterministic MAC address from an IPv4 address.
+
+    Uses the locally administered prefix '52:54:00' followed by the last three octets of the
+    address. Within a single /8 this guarantees uniqueness without keeping a second registry,
+    and it lets one read the IP address back from a packet capture.
+
+    Returns: the MAC address as a string, or None if the IP address is not a valid IPv4.
+    """
+    try:
+        address = ipaddress.ip_address(ip_address)
+    except ValueError:
+        logger.error(f"Error: cannot derive a MAC address from '{ip_address}': not a valid IP address.")
+        return None
+
+    if address.version != 4:
+        logger.error(f"Error: MAC derivation is only supported for IPv4 addresses, got '{ip_address}'.")
+        return None
+
+    return f"{DERIVED_MAC_PREFIX}:" + ":".join(f"{octet:02x}" for octet in address.packed[-3:])
+
+def is_valid_mac(mac_address):
+    """Helper function to validate a MAC address in the colon-separated hexadecimal form."""
+    return bool(re.fullmatch(r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', mac_address or ''))
+
 def get_instance_state_dict (instance):
     """Return a dictionary with the state information of the instance."""
 
@@ -803,9 +971,14 @@ def exec_command(instance, command):
 ###### figo instance command functions #####
 #############################################
 
-def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_scope=None, full=False, join=False):
+def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_scope=None, full=False, join=False,
+                            additional=False):
     """Get instances from the specified remote node and project and add their details using add_row_to_output.
-    
+
+    If additional is False, an instance holding additional IP addresses is marked with a '+N'
+    counter appended to its address column. If additional is True, each additional address gets
+    its own row below the instance holding it, and the NAME and MAC columns are filled in.
+
     Returns:    False if fetching the instances failed, True otherwise.
     """
 
@@ -831,54 +1004,95 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
 
         ip_device_pairs = get_ip_device_pairs(instance) # Get the IP addresses and device names
 
+        # Additional IP addresses held by the instance (nested VMs, inner containers, extra
+        # addresses on its own NIC). See ADDITIONAL_IPS_KEY.
+        additional_entries = get_additional_ips_from_config(instance.get("config"))
+
+        ip_str = format_ip_device_pairs(ip_device_pairs)
+        if additional_entries:
+            # The address column is narrow: spelling the addresses out inline would truncate
+            # immediately and convey less than the counter does. Use -a/--additional to see them.
+            ip_str = f"{ip_str} +{len(additional_entries)}"
+
         if full:
             # Print all profiles
             profiles_str = ", ".join(instance.get("profiles", []))
-            if join:
-                # Join the context and instance name
-                add_row_to_output(COLS, [f"{context}.{name}", instance_type, state,
-                                         format_ip_device_pairs(ip_device_pairs), profiles_str])
-            else:
-                add_row_to_output(COLS, [name, instance_type, state, context,
-                                     format_ip_device_pairs(ip_device_pairs), profiles_str])
+            reset_color = False
         else:
             # Print only GPU profiles with color coding based on state
             gpu_profiles = [profile for profile in instance.get("profiles", []) if profile.startswith("gpu")]
-            profiles_str = ", ".join(gpu_profiles)
-            colored_profiles_str = f"{RED}{profiles_str}{RESET}" if state == "run" else f"{GREEN}{profiles_str}{RESET}"
-            if join:
-                add_row_to_output(COLS, [f"{context}.{name}", instance_type, state,
-                                         format_ip_device_pairs(ip_device_pairs), colored_profiles_str], reset_color=True)
+            plain_profiles_str = ", ".join(gpu_profiles)
+            profiles_str = (f"{RED}{plain_profiles_str}{RESET}" if state == "run"
+                            else f"{GREEN}{plain_profiles_str}{RESET}")
+            reset_color = True
+
+        # Join the context and instance name, when requested
+        name_field = f"{context}.{name}" if join else name
+
+        def build_row(instance_field, type_field, state_field, context_field,
+                      ip_field, name_col, mac_col, profiles_field):
+            """Assemble a row matching the columns selected in list_instances."""
+            row = [instance_field, type_field, state_field]
+            if not join:
+                row.append(context_field)
+            row.append(ip_field)
+            if additional:
+                # With -a the profiles are dropped: see the note in list_instances.
+                row.extend([name_col, mac_col])
             else:
-                add_row_to_output(COLS, [name, instance_type, state, context,
-                                     format_ip_device_pairs(ip_device_pairs), colored_profiles_str],
-                                     reset_color=True)
+                row.append(profiles_field)
+            return row
+
+        add_row_to_output(COLS,
+                          build_row(name_field, instance_type, state, context, ip_str, '', '', profiles_str),
+                          reset_color=reset_color and not additional)
+
+        if additional:
+            # One row per additional address, below the instance holding it. STATE, CONTEXT and
+            # PROFILES describe an instance, and an address is not one, so they are left empty.
+            # The instance name is repeated so that every row stands on its own when the output
+            # is grepped, sorted or pasted in isolation.
+            for entry in additional_entries:
+                add_row_to_output(COLS,
+                                  build_row(name_field, 'additional_ip', '', '', entry['ip'],
+                                            entry['name'] or '', entry['mac'] or '', ''))
     return True
     
 
-def list_instances(remote_node=None, project_name=None, instance_scope=None, full=False, extend=False, join=False):
+def list_instances(remote_node=None, project_name=None, instance_scope=None, full=False, extend=False, join=False,
+                   additional=False):
     """Print profiles of all instances, either from the local or a remote Incus node.
-    
+
     If full is False, prints only GPU profiles with color coding.
     If full is True, prints all profiles.
 
     If extend is True, the output of each column is extended to the maximum width of the values in that column.
     If join is True, the context and intance name are joined into a single string and extend is set to True.
 
+    If additional is True, each additional IP address held by an instance gets its own row, and
+    the NAME and MAC columns are added. Otherwise those addresses are only summarised by a '+N'
+    counter in the address column.
+
     """
 
     if join:
         extend = True
-    
-    # Determine the columns based on the 'full' and 'join' flag
-    if full and join:
-        COLS = [('INSTANCE WITH CONTEXT',35), ('TYPE',4), ('STATE',5), ('IP ADDRESS(ES)',25), ('PROFILES',75)]
-    elif full: # full is True and join is False
-        COLS = [('INSTANCE',16), ('TYPE',4), ('STATE',5), ('CONTEXT',25), ('IP ADDRESS(ES)',25), ('PROFILES',75)]
-    elif join: # full is False and join is True
-        COLS = [('INSTANCE WITH CONTEXT',35), ('TYPE',4), ('STATE',5), ('IP ADDRESS(ES)',25), ('GPU PROFILES',75)]
-    else: # full is False and join is False
-        COLS = [('INSTANCE',16), ('TYPE',4), ('STATE',5), ('CONTEXT',25), ('IP ADDRESS(ES)',25), ('GPU PROFILES',75)]
+
+    # Determine the columns based on the 'full', 'join' and 'additional' flags.
+    # With 'additional' the TYPE column must fit the 'additional_ip' value, and two columns are
+    # added to carry the label and the MAC of each address.
+    if join:
+        COLS = [('INSTANCE WITH CONTEXT',35), ('TYPE', 13 if additional else 4), ('STATE',5)]
+    else:
+        COLS = [('INSTANCE',16), ('TYPE', 13 if additional else 4), ('STATE',5), ('CONTEXT',25)]
+    COLS.append(('IP ADDRESS(ES)',25))
+    if additional:
+        # The profiles column is dropped in this view: it is empty by definition on the address
+        # rows, and the room taken by TYPE, NAME and MAC already pushes the line close to the
+        # width of a normal terminal. Whoever asks for -a is looking at addresses, not profiles.
+        COLS.extend([('NAME',12), ('MAC',17)])
+    else:
+        COLS.append(('PROFILES',75) if full else ('GPU PROFILES',75))
 
     add_header_line_to_output(COLS)
 
@@ -902,13 +1116,13 @@ def list_instances(remote_node=None, project_name=None, instance_scope=None, ful
                     for project in projects:
                         my_project_name = project["name"]
                         result = get_and_print_instances(COLS, remote_node=my_remote_node, project_name=my_project_name,
-                                                         instance_scope=instance_scope, full=full, join=join)
+                                                         instance_scope=instance_scope, full=full, join=join, additional=additional)
                         if not result:
                             set_of_errored_remotes.add(my_remote_node)
             else: # project_name is not None
                 # Get instances for the specified project_name
                 result = get_and_print_instances(COLS, remote_node=my_remote_node, project_name=project_name,
-                                                 instance_scope=instance_scope, full=full, join=join)
+                                                 instance_scope=instance_scope, full=full, join=join, additional=additional)
                 if not result:
                     set_of_errored_remotes.add(my_remote_node)
     else: # remote_node is not None
@@ -922,13 +1136,13 @@ def list_instances(remote_node=None, project_name=None, instance_scope=None, ful
                 for project in projects:
                     my_project_name = project["name"]
                     result = get_and_print_instances(COLS, remote_node=remote_node, project_name=my_project_name,
-                                                     instance_scope=instance_scope, full=full, join=join)
+                                                     instance_scope=instance_scope, full=full, join=join, additional=additional)
                     if not result:
                         set_of_errored_remotes.add(remote_node)
         else: # remote_node is not None and project_name is not None
             # Get instances from the specified remote node and project
             result = get_and_print_instances(COLS, remote_node=remote_node, project_name=project_name,
-                                             instance_scope=instance_scope, full=full, join=join)
+                                             instance_scope=instance_scope, full=full, join=join, additional=additional)
             if not result:
                 set_of_errored_remotes.add(remote_node)
 
@@ -1470,6 +1684,11 @@ def retrieve_assigned_ips(remote):
         for instance_state_dict in iterator_over_instance_dicts(remote, project["name"]):
             ip_addresses = get_ip_addresses(instance_state_dict)
             assigned_ips.extend(ip_addresses)
+            # add the additional IP addresses held by the instance, if any
+            # (addresses of nested QEMU VMs, inner containers, extra addresses on its own NIC)
+            assigned_ips.extend(
+                [entry['ip'] for entry in
+                 get_additional_ips_from_config(instance_state_dict.get("config"))])
             #if the instance name starts with l1- get the l2 IP addresses
             if instance_state_dict["name"].startswith("l1-"):
                 #get the instance object
@@ -5202,14 +5421,16 @@ def create_instance_parser(subparsers):
                     "The scope can include 'remote:project.', 'project.', or 'remote:'.\n"
                     "Use the -f/--full option to display more detailed information.\n"
                     "Use the -e/--extend option to extend column width for better readability.\n"
-                    "Use the -j/--join option to combine the context and instance name into a single field for display.",
+                    "Use the -j/--join option to combine the context and instance name into a single field for display.\n"
+                    "Use the -a/--additional option to show one row for each additional IP address held by an instance.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
             "  figo instance list\n"
             "  figo instance list remote:project.\n"
             "  figo instance list project. -r remote_name\n"
             "  figo instance list -f --extend\n"
-            "  figo instance list -j"
+            "  figo instance list -j\n"
+            "  figo instance list -a"
     )
     instance_list_parser.add_argument(
         "-f", "--full", action="store_true", help="Show full details of instance profiles"
@@ -5220,6 +5441,11 @@ def create_instance_parser(subparsers):
     instance_list_parser.add_argument(
         "-j", "--join", action="store_true",
         help="Join the context and instance name into a single field."
+    )
+    instance_list_parser.add_argument(
+        "-a", "--additional", action="store_true",
+        help="Expand each instance holding additional IP addresses into one row per address,\n"
+             "and add the NAME and MAC columns."
     )
     instance_list_parser.add_argument(
         "scope", nargs="?", help="Scope in the format 'remote:project.', 'project.', or 'remote:' to limit the listing"
@@ -5380,6 +5606,123 @@ def create_instance_parser(subparsers):
     )
     add_common_arguments(set_ip_parser)
     add_common_ip_gw_nic_arguments(set_ip_parser)
+
+    # Additional IP command, with its own list/add/remove subcommands
+    additional_ip_parser = instance_subparsers.add_parser(
+        "additional_ip",
+        aliases=["aip"],
+        help="Manage the additional IP addresses held by an instance.",
+        description="Manage the additional IP addresses held by an instance.\n"
+                    "Besides the address configured on the instance itself, an instance can hold further\n"
+                    "addresses of the same subnet: addresses used by nested QEMU virtual machines it runs,\n"
+                    "by containers started inside it, or extra addresses on its own NIC.\n"
+                    "Registering them makes the IPAM aware that they are taken, so that they are never\n"
+                    "handed out to another instance.\n"
+                    "figo records these addresses, it does NOT configure anything inside the instance.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+            "  figo instance additional_ip list\n"
+            "  figo instance additional_ip add my_instance --mac auto -n gob0\n"
+            "  figo instance additional_ip remove my_instance 10.202.9.214"
+    )
+    additional_ip_subparsers = additional_ip_parser.add_subparsers(dest="additional_ip_command")
+
+    # Additional IP: list
+    additional_ip_list_parser = additional_ip_subparsers.add_parser(
+        "list",
+        aliases=["l"],
+        help="List the additional IP addresses held by an instance, or by all instances in a scope.",
+        description="List the additional IP addresses held by an instance.\n"
+                    "If the instance name is omitted, the additional addresses of all the instances\n"
+                    "in the scope are listed.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+            "  figo instance additional_ip list\n"
+            "  figo instance additional_ip list my_instance\n"
+            "  figo instance additional_ip list remote:project.my_instance\n"
+            "  figo instance additional_ip list -r remote_name --extend"
+    )
+    additional_ip_list_parser.add_argument(
+        "instance_name", nargs="?",
+        help="Name of the instance. Can include remote and project scope.\n"
+             "If omitted, all the instances in the scope are listed."
+    )
+    additional_ip_list_parser.add_argument(
+        "-e", "--extend", action="store_true", help="Extend column width to fit content"
+    )
+    add_common_arguments(additional_ip_list_parser)
+
+    # Additional IP: add
+    additional_ip_add_parser = additional_ip_subparsers.add_parser(
+        "add",
+        aliases=["a"],
+        help="Register an additional IP address held by an instance.",
+        description="Register an additional IP address held by an instance.\n"
+                    "If the IP address is not provided, an available one is assigned and printed.\n"
+                    "By default the next address after the highest assigned one is chosen, but using\n"
+                    "--hole assigns the first available gap in the IP range.\n"
+                    "The command fails if the address is already in use, or outside the subnet of the remote.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+            "  figo instance additional_ip add my_instance\n"
+            "  figo instance additional_ip add my_instance --mac auto -n gob0\n"
+            "  figo instance additional_ip add remote:project.my_instance 10.202.9.214 --mac 52:54:00:ca:09:d6\n"
+            "  figo instance additional_ip add my_instance --hole --mac auto -n justin"
+    )
+    additional_ip_add_parser.add_argument(
+        "instance_name",
+        help="Name of the instance holding the address. Can include remote and project scope."
+    )
+    additional_ip_add_parser.add_argument(
+        "ip_address", nargs="?",
+        help="IP address to register, without prefix length (e.g. 10.202.9.214).\n"
+             "If omitted, an available address is assigned by figo and printed."
+    )
+    additional_ip_add_parser.add_argument(
+        "--mac",
+        help="MAC address to record for the entry. Use the literal value 'auto' to have it derived\n"
+             "deterministically from the IP address. If omitted, no MAC address is recorded."
+    )
+    additional_ip_add_parser.add_argument(
+        "-n", "--name",
+        help="A free-form label recording what the address is used for."
+    )
+    additional_ip_add_parser.add_argument(
+        "-o", "--hole",
+        action="store_true",
+        help="Assign the first available IP address hole in the range, rather than the next sequential IP.\n"
+             "Only meaningful when the IP address is not provided."
+    )
+    add_common_arguments(additional_ip_add_parser)
+
+    # Additional IP: remove
+    additional_ip_remove_parser = additional_ip_subparsers.add_parser(
+        "remove",
+        aliases=["r"],
+        help="Remove one additional IP address registration from an instance, or all of them.",
+        description="Remove one additional IP address registration from an instance, or all of them.\n"
+                    "Exactly one of the IP address and --all must be provided.\n"
+                    "Removing a registration only frees the address for future allocation: whatever was\n"
+                    "using it is not stopped nor reconfigured.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+            "  figo instance additional_ip remove my_instance 10.202.9.214\n"
+            "  figo instance additional_ip remove remote:project.my_instance 10.202.9.214\n"
+            "  figo instance additional_ip remove my_instance --all"
+    )
+    additional_ip_remove_parser.add_argument(
+        "instance_name",
+        help="Name of the instance. Can include remote and project scope."
+    )
+    additional_ip_remove_parser.add_argument(
+        "ip_address", nargs="?",
+        help="IP address to remove. Must not be given together with --all."
+    )
+    additional_ip_remove_parser.add_argument(
+        "-a", "--all", action="store_true",
+        help="Remove every additional address registered for the instance."
+    )
+    add_common_arguments(additional_ip_remove_parser)
 
     # Create command
     create_parser = instance_subparsers.add_parser(
@@ -5550,7 +5893,194 @@ def handle_instance_list(args):
 
     # Pass the `extend` flag to list_instances to adjust column width as specified by user
     list_instances(remote_node, project_name=project_name, instance_scope=instance_scope,
-                   full=args.full, extend=args.extend, join=args.join)
+                   full=args.full, extend=args.extend, join=args.join,
+                   additional=getattr(args, 'additional', False))
+
+def _get_instance_object(remote, project, instance):
+    """Fetch a pylxd instance object, logging the reason when it cannot be obtained.
+
+    Returns: the instance object, or None on failure.
+    """
+    client_instance = get_remote_client(remote, project_name=project)
+    if not client_instance:
+        logger.error(f"Failed to connect to remote '{remote}', project '{project}'.")
+        return None
+    try:
+        return client_instance.instances.get(instance)
+    except Exception as e:
+        logger.error(f"Error: instance '{instance}' not found in '{remote}:{project}': {e}")
+        return None
+
+def handle_additional_ip_list(args):
+    """Handle 'figo instance additional_ip list'."""
+    COLS = [('INSTANCE',16), ('CONTEXT',25), ('IP ADDRESS',16), ('NAME',12), ('MAC',17)]
+
+    def iterate_targets():
+        """Yield (remote, project, instance_scope) triples covering the requested scope."""
+        if args.instance_name:
+            remote, project, instance = parse_instance_scope(args.instance_name, args.remote, args.project)
+            if instance is None:
+                return
+            yield remote, project, instance
+            return
+
+        if args.remote:
+            remotes = [args.remote]
+        else:
+            all_remotes = get_incus_remotes() or {}
+            # skip the image servers, they hold no instances
+            remotes = [name for name, info in all_remotes.items()
+                       if info.get("Protocol") != "simplestreams"]
+
+        for remote in remotes:
+            if args.project:
+                yield remote, args.project, None
+            else:
+                projects = get_projects(remote_name=remote)
+                if projects is None:
+                    logger.error(f"Error: Failed to retrieve the projects of remote '{remote}'.")
+                    continue
+                for project in projects:
+                    yield remote, project["name"], None
+
+    add_header_line_to_output(COLS)
+
+    found = False
+    for remote, project, instance_scope in iterate_targets():
+        for instance_state_dict in iterator_over_instance_dicts(remote, project, instance_scope):
+            for entry in get_additional_ips_from_config(instance_state_dict.get("config")):
+                found = True
+                add_row_to_output(COLS, [instance_state_dict.get("name", "Unknown"),
+                                         f"{remote}:{project}",
+                                         entry['ip'],
+                                         entry['name'] or '',
+                                         entry['mac'] or ''])
+
+    flush_output(extend=args.extend)
+
+    if not found:
+        logger.info("No additional IP addresses are registered in the specified scope.")
+    return True
+
+def handle_additional_ip_add(args):
+    """Handle 'figo instance additional_ip add'."""
+    remote, project, instance = parse_instance_scope(args.instance_name, args.remote, args.project)
+    if instance is None:
+        return False
+
+    # The subnet of the remote is needed both to validate a user-provided address and to detect
+    # the exhaustion of the range when figo assigns one.
+    gw_address = get_gw_address(remote)
+    prefix_len = get_prefix_len(remote)
+    if gw_address is None or prefix_len is None:
+        return False
+
+    # Either validate the address provided by the user, or let figo assign one. The two paths
+    # report a failure differently: an address out of the subnet is a mistake of the caller,
+    # while an assigned address out of the subnet means the range has been used up.
+    if args.ip_address:
+        if not is_valid_ip(args.ip_address):
+            logger.error(f"Error: Invalid IP address '{args.ip_address}'.")
+            return False
+        ip_address = args.ip_address
+        if not is_same_subnet(ip_address, gw_address, prefix_len):
+            logger.error(f"Error: IP address '{ip_address}' is not in the subnet of remote '{remote}'.")
+            return False
+    else:
+        ip_address = assign_ip_address(remote, mode="hole" if args.hole else "next")
+        if ip_address is None:
+            logger.error(f"Error: Failed to assign an IP address on remote '{remote}'.")
+            return False
+        if not is_same_subnet(ip_address, gw_address, prefix_len):
+            logger.error(f"Error: No IP address is left to assign on remote '{remote}': "
+                         f"the range of the subnet {gw_address}/{prefix_len} is used up.")
+            return False
+
+    # The address must not be in use, no matter what holds it: an instance, the additional
+    # addresses of any instance, or the nested instances of an L1 host.
+    assigned_ips = retrieve_assigned_ips(remote)
+    if assigned_ips is None:
+        return False
+    if ip_address in assigned_ips:
+        logger.error(f"Error: IP address '{ip_address}' is already in use on remote '{remote}'.")
+        return False
+
+    mac_address = None
+    if args.mac:
+        if args.mac.lower() == 'auto':
+            mac_address = derive_mac_from_ip(ip_address)
+            if mac_address is None:
+                return False
+        elif is_valid_mac(args.mac):
+            mac_address = args.mac.lower()
+        else:
+            logger.error(f"Error: Invalid MAC address '{args.mac}'.")
+            return False
+
+    instance_object = _get_instance_object(remote, project, instance)
+    if instance_object is None:
+        return False
+
+    if not add_additional_ip(instance_object, ip_address, mac=mac_address, name=args.name):
+        return False
+
+    logger.info(f"Additional IP address '{ip_address}' registered for instance "
+                f"'{remote}:{project}.{instance}'"
+                + (f" with MAC '{mac_address}'" if mac_address else "") + ".")
+    # Print the address, and nothing else, on stdout: the log goes to stderr, so the command can
+    # be used as IP=$(figo instance additional_ip add ...) whatever flags were passed. The shape
+    # of this line must not depend on the options, or it stops being usable in a script.
+    print(ip_address)
+    return True
+
+def handle_additional_ip_remove(args):
+    """Handle 'figo instance additional_ip remove'."""
+    if bool(args.ip_address) == bool(args.all):
+        logger.error("Error: provide either an IP address or --all, but not both.")
+        return False
+
+    remote, project, instance = parse_instance_scope(args.instance_name, args.remote, args.project)
+    if instance is None:
+        return False
+
+    if args.ip_address and not is_valid_ip(args.ip_address):
+        logger.error(f"Error: Invalid IP address '{args.ip_address}'.")
+        return False
+
+    instance_object = _get_instance_object(remote, project, instance)
+    if instance_object is None:
+        return False
+
+    if args.all:
+        return clear_additional_ip_list(instance_object)
+    return remove_additional_ip(instance_object, args.ip_address)
+
+def handle_instance_additional_ip(args):
+    """Handle the 'additional_ip' subcommand group for instances."""
+    if not args.additional_ip_command:
+        logger.error("Error: No additional_ip subcommand provided. "
+                     "Use 'figo instance additional_ip --help' to see the available subcommands.")
+        return False
+
+    # Derive the project from the user, consistently with the other instance subcommands.
+    if getattr(args, 'user', None) and not args.relax:
+        user_project = derive_project_from_user(args.user)
+        if user_project:
+            if args.project and user_project != args.project:
+                logger.error(f"Error: Conflict between derived project '{user_project}' from user "
+                             f"'{args.user}' and provided project '{args.project}'.")
+                return False
+            args.project = user_project
+
+    if args.additional_ip_command in ["list", "l"]:
+        return handle_additional_ip_list(args)
+    elif args.additional_ip_command in ["add", "a"]:
+        return handle_additional_ip_add(args)
+    elif args.additional_ip_command in ["remove", "r"]:
+        return handle_additional_ip_remove(args)
+
+    logger.error(f"Error: Unknown additional_ip subcommand '{args.additional_ip_command}'.")
+    return False
 
 def handle_instance_command(args, parser_dict):
     if not args.instance_command:
@@ -5673,6 +6203,8 @@ def handle_instance_command(args, parser_dict):
 
     if args.instance_command in ["list", "l"]:
         handle_instance_list(args)
+    elif args.instance_command in ["additional_ip", "aip"]:
+        handle_instance_additional_ip(args)
     else:
         provided_user = None
         

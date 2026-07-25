@@ -56,6 +56,7 @@ Each command has its own set of subcommands and options.
 - **Remote and Project Support:** Manage instances across remotes and projects with scoped commands.
 - **Key Management:** Add or view authorized keys for users in specific instances.
 - **Dynamic Network Configuration:** Assign static IP addresses or use automatic assignment for seamless networking.
+- **Additional IP Addresses:** Register further addresses held by an instance (for nested virtual machines, inner containers, or extra addresses on its own NIC) so that the IPAM never hands them out to anybody else.
 - **Instance Execution:** Execute bash commands directly within instances, with automatic start if required.
 - **Flexibility:** Supports containers, virtual machines (VMs), and multiple instance profiles.
 
@@ -72,6 +73,7 @@ Each command has its own set of subcommands and options.
 - [`figo instance set_key`](#figo-instance-set_key)
 - [`figo instance show_keys`](#figo-instance-show_keys)
 - [`figo instance set_ip`](#figo-instance-set_ip)
+- [`figo instance additional_ip`](#figo-instance-additional_ip)
 - [`figo instance create`](#figo-instance-create)
 - [`figo instance delete`](#figo-instance-delete)
 - [`figo instance bash`](#figo-instance-bash)
@@ -80,11 +82,11 @@ Each command has its own set of subcommands and options.
 
 - #### `figo instance list`
 
-  - **Description:** List instances, with options to specify a scope, remote, and project. Use the `--full` option to display detailed information. The `--extend` option adjusts column widths for better readability. The `--join` option combines the context and instance name into a single field.
+  - **Description:** List instances, with options to specify a scope, remote, and project. Use the `--full` option to display detailed information. The `--extend` option adjusts column widths for better readability. The `--join` option combines the context and instance name into a single field. The address column reports the address of each instance, followed by `+N` when the instance also holds N **additional addresses** (see [`figo instance additional_ip`](#figo-instance-additional_ip)).
   - **Syntax:**
 
     ```bash
-    figo instance list [scope] [-f | --full] [-e | --extend] [-j | --join] [-r remote] [-p project] [-u user]
+    figo instance list [scope] [-f | --full] [-e | --extend] [-j | --join] [-a | --additional] [-r remote] [-p project] [-u user]
     ```
 
   - **Options:**
@@ -92,9 +94,29 @@ Each command has its own set of subcommands and options.
     - `-f, --full`: Show full details of instance profiles.
     - `-e, --extend`: Extend column width to fit content.
     - `-j, --join`: Combine the context and instance name into a single field for display.
+    - `-a, --additional`: Expand each instance that holds additional IP addresses into one extra row per address, and add the `NAME` and `MAC` columns.
     - `-r, --remote`: Specify the remote server name.
     - `-p, --project`: Specify the project name.
     - `-u, --user`: Specify the username to infer the project.
+
+  - **Details:**
+    - When an instance holds additional addresses, the address column appends `+N`, where N is how many — for example `10.202.9.213 (enp5s0) +3`. The addresses themselves are deliberately not spelled out here: the column is 25 characters wide and a single `address (device)` entry already fills most of it, so listing them inline would truncate immediately and convey less than the counter does. Use [`figo instance additional_ip list`](#figo-instance-additional_ip-list) to see them, with MAC and label.
+    - The counter is shown for the same reason the addresses are tracked at all: they are part of the occupancy of the subnet, and a listing with no trace of them would suggest that those addresses are free.
+
+    - With `-a/--additional` the counter is expanded: every additional address held by an instance gets **its own row**, placed under the instance that holds it. On those rows `TYPE` reads `additional_ip`, while `STATE` and `CONTEXT` are left empty — they describe an instance, and an address is not one. Two columns are added, `NAME` and `MAC`, carrying the label and the MAC recorded for the address, and empty on ordinary instance rows.
+
+      ```
+      INSTANCE         TYPE          STATE CONTEXT                   IP ADDRESS(ES)            NAME         MAC
+      ioam-factory     vm            run   blade3:figo-ioam-factory  10.202.9.213 (enp5s0) +3
+      ioam-factory     additional_ip                                 10.202.9.214              gob0         52:54:00:ca:09:d6
+      ioam-factory     additional_ip                                 10.202.9.215              ramon        52:54:00:ca:09:d7
+      ioam-factory     additional_ip                                 10.202.9.216              justin       52:54:00:ca:09:d8
+      file-server      vm            run   blade3:default            10.202.9.201 (enp5s0)
+      ```
+
+      The profiles column is **dropped** in this view. It is empty by definition on the address rows, and the room taken by the wider `TYPE` plus `NAME` and `MAC` would otherwise push the line past the width of a normal terminal, wrapping the profiles in mid-word. Whoever asks for `-a` is looking at addresses, not at profiles.
+
+      The `INSTANCE` column repeats the name of the instance holding the address, so that every row stands on its own and remains meaningful when the output is grepped, sorted or pasted in isolation. The `+N` counter is kept on the instance row, where it now also tells how many rows follow.
 
   - **Examples:**
 
@@ -106,6 +128,8 @@ Each command has its own set of subcommands and options.
     figo instance list project. -u custom_user
     figo instance list project. -j
     figo instance list project. -j -e
+    figo instance list -a
+    figo instance list -a -r blade3 --extend
     ```
 
 - #### `figo instance start`
@@ -248,6 +272,141 @@ Each command has its own set of subcommands and options.
     figo instance set_ip my_remote:my_project.instance_name --hole
     figo instance set_ip remote:project.instance_name
     figo instance set_ip instance_name -u custom_user -n eth1 -r remote_name
+    ```
+
+- #### `figo instance additional_ip`
+
+  - **Description:** Manage the **additional IP addresses held by an instance**. Besides the address configured on the instance itself (see [`figo instance set_ip`](#figo-instance-set_ip)), an instance may hold further addresses of the same subnet: addresses used by nested QEMU virtual machines it runs, by containers started inside it, or simply extra addresses configured on its own NIC. Registering them makes figo's IPAM aware that those addresses are taken, so they are never handed out to another instance.
+
+    figo deliberately does **not** model what sits behind an additional address. It records the address, optionally a MAC and a label, and nothing else.
+
+  - **Subcommands:**
+    - [`figo instance additional_ip list`](#figo-instance-additional_ip-list)
+    - [`figo instance additional_ip add`](#figo-instance-additional_ip-add)
+    - [`figo instance additional_ip remove`](#figo-instance-additional_ip-remove)
+
+  - **Details:**
+
+    - **figo records, it does not configure.** These commands change figo's bookkeeping only. No interface is created, no address is applied inside the instance, no DHCP reservation is written. Whatever uses the address must be configured by whoever runs it. Consequently the instance does **not** need to be stopped (unlike `set_ip`) and is never restarted.
+
+    - **Same allocation pool as instances.** Additional addresses are drawn from the same pool as instance addresses. An additional address can therefore never collide with an instance address, nor with an additional address of another instance.
+
+    - **Where the state is kept.** In the instance configuration, under the `user.figo.additional_ips` key, as a YAML list. It is visible with `incus config show <instance>` and it is deleted together with the instance, so an instance can never leave stale address registrations behind. Example of a stored value:
+
+      ```yaml
+      - ip: 10.202.9.214
+        mac: 52:54:00:ca:09:d6
+        name: gob0
+      - ip: 10.202.9.215
+        name: dev-guest
+      ```
+
+    - **Relation to L1 hosts and `user.l2_ip_list`.** An L1 host records, in a separate `user.l2_ip_list` key, the addresses of the nested **Incus** instances that figo itself created through the L1 remote. The two keys are distinct and both are honoured by the allocator, because they hold different kinds of fact: `l2_ip_list` is an *index* of instances that exist as objects elsewhere, while `additional_ips` is a *primary record* of addresses about which figo knows nothing else. Neither replaces the other, and an address should appear in only one of them.
+
+- #### `figo instance additional_ip list`
+
+  - **Description:** List the additional IP addresses held by an instance, or by all the instances in a scope.
+  - **Syntax:**
+
+    ```bash
+    figo instance additional_ip list [instance_name] [-r remote] [-p project] [-u user] [-e | --extend]
+    ```
+
+  - **Options:**
+    - `instance_name`: The name of the instance, which can include remote and project scope. If omitted, the additional addresses of all the instances in the scope are listed.
+    - `-r, --remote`: Specify the remote server name.
+    - `-p, --project`: Specify the project name.
+    - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
+    - `-e, --extend`: Extend column width to fit the content.
+
+  - **Details:**
+    - The table reports, for each entry, the holding instance, the address, the MAC (if recorded) and the label (if any).
+    - [`figo instance list`](#figo-instance-list) does not spell out these addresses: it only appends `+N` to the address of the instance holding them, as a reminder that they exist. This command is where the addresses themselves are shown, which makes it the way to answer "who is using this address?".
+
+  - **Examples:**
+
+    ```bash
+    figo instance additional_ip list
+    figo instance additional_ip list ioam-factory
+    figo instance additional_ip list blade3:figo-ioam-factory.ioam-factory
+    figo instance additional_ip list -r blade3 --extend
+    figo instance additional_ip list -u custom_user
+    ```
+
+- #### `figo instance additional_ip add`
+
+  - **Description:** Register an additional IP address held by an instance. If the address is not provided, an available one is assigned and printed. By default the next address after the highest assigned one is used; with `--hole`, the first available gap in the range.
+  - **Syntax:**
+
+    ```bash
+    figo instance additional_ip add instance_name [ip_address] [--mac mac_address | --mac auto] [-n name] [-r remote] [-p project] [-u user] [-o | --hole]
+    ```
+
+  - **Options:**
+    - `instance_name`: The name of the instance holding the address, which can include remote and project scope.
+    - `ip_address`: Optional. The address to register, without prefix length (e.g. `10.202.9.214`). If omitted, figo assigns an available address and prints it.
+    - `--mac`: Record a MAC address for the entry. With the literal value `auto`, figo derives it deterministically from the IP address (prefix `52:54:00` followed by the last three octets), which guarantees uniqueness within the subnet without maintaining a second registry. If the option is omitted, no MAC is recorded.
+    - `-n, --name`: A free-form label for the entry, to record what the address is used for.
+    - `-r, --remote`: Specify the remote server name.
+    - `-p, --project`: Specify the project name.
+    - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
+    - `-o, --hole`: Assigns the first available IP address hole in the range rather than the next sequential IP. Only meaningful when `ip_address` is omitted.
+
+  - **Details:**
+    - **Both forms are validated.** Whether the address is chosen by figo or passed explicitly, the command **fails** if it is already assigned to an instance, already registered as an additional address of any instance, already listed by an L1 host, or outside the subnet of the remote. An explicit address is therefore just as safe against double assignment as an automatic one. Note that the check and the registration are not atomic, so — exactly as for `set_ip` and `create` — two concurrent figo invocations can still end up choosing the same address.
+    - **On success the address, and only the address, is printed on standard output**, so that the command can be used as `IP=$(figo instance additional_ip add my_instance --mac auto)`. Log messages go to standard error.
+    - **Letting figo choose is still the better habit**, for a different reason than safety: when a human picks the address, the choice tends to follow conventions that live in people's heads rather than in figo — "the top of the range is for nested guests", "leave a gap after the servers". figo cannot see those conventions, and will happily allocate into them later.
+    - Omitting `--mac` is the right choice when the address is an extra address on the instance's own NIC, where a distinct MAC would be meaningless. It is normally recorded when the address belongs to a virtual machine or a container running inside the instance, which has its own interface on the bridge.
+
+  - **Examples:**
+
+    ```bash
+    # Let figo assign the address, and print it
+    figo instance additional_ip add ioam-factory
+
+    # Address assigned by figo, MAC derived from it, labelled
+    figo instance additional_ip add ioam-factory --mac auto -n gob0
+
+    # Fully explicit
+    figo instance additional_ip add blade3:figo-ioam-factory.ioam-factory 10.202.9.214 --mac 52:54:00:ca:09:d6 -n gob0
+
+    # Reuse a gap left by a removed entry rather than growing the range
+    figo instance additional_ip add ioam-factory --hole --mac auto -n justin
+
+    figo instance additional_ip add my_instance -u custom_user -r remote_name
+    ```
+
+- #### `figo instance additional_ip remove`
+
+  - **Description:** Remove one additional IP address registration from an instance, or all of them.
+  - **Syntax:**
+
+    ```bash
+    figo instance additional_ip remove instance_name [ip_address] [-a | --all] [-r remote] [-p project] [-u user]
+    ```
+
+  - **Options:**
+    - `instance_name`: The name of the instance, which can include remote and project scope.
+    - `ip_address`: The address to remove. Must not be given together with `--all`.
+    - `-a, --all`: Remove every additional address registered for the instance.
+    - `-r, --remote`: Specify the remote server name.
+    - `-p, --project`: Specify the project name.
+    - `-u, --user`: Specify the username to infer the project.
+    - `-x, --relax`: Use `-u/--user` only for key filename derivation, no consistency checks between `-p/--project` and `-u/--user`.
+
+  - **Details:**
+    - Exactly one of `ip_address` and `--all` must be provided; giving both, or neither, is an error.
+    - Removing a registration only frees the address for future allocation. Whatever was using it is not stopped or reconfigured, so remove the entry **after** the entity behind it is gone, not before.
+
+  - **Examples:**
+
+    ```bash
+    figo instance additional_ip remove ioam-factory 10.202.9.214
+    figo instance additional_ip remove blade3:figo-ioam-factory.ioam-factory 10.202.9.214
+    figo instance additional_ip remove ioam-factory --all
+    figo instance additional_ip remove my_instance 10.0.0.5 -u custom_user -r remote_name
     ```
 
 - #### `figo instance create`
