@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# pytest
+.pytest_cache/
+
 # Incus client certificates and keys used by figo at runtime: the working
 # directory of the repository is also figo's working directory on the
 # controller, so these appear here and must never reach the remote.
