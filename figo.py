@@ -24,6 +24,7 @@ import time
 import paramiko
 import glob
 import shlex
+import collections
 
 # Configuration for the WireGuard VPN server
 # The following configuration is used to set up a WireGuard VPN server on a MikroTik router.
@@ -1151,44 +1152,173 @@ def list_instances(remote_node=None, project_name=None, instance_scope=None, ful
     if set_of_errored_remotes:
         logger.error(f"Error: Failed to retrieve projects from remote(s): {', '.join(set_of_errored_remotes)}")
 
-def get_pci_addresses (remote):
-    """Get the PCI addresses of the GPUs available on the remote node.
-    
-    Returns:    A list of PCI addresses if successful, None otherwise.
+# --- GPU discovery: four outcomes, not a bare None --------------------------
+#
+# Section 7 of figo-gpu-resource-model.md: 'no GPU on this host', 'the host does
+# not answer', 'the host is not in REMOTE_TO_IP_INFO_MAP' and 'the command
+# failed' used to collapse into one ERROR + None. They are four different
+# situations with four different reactions, and the third one is the ordinary
+# state of every L1 host until req 13 lands: an L1 host must not look broken
+# just because figo cannot yet reach it.
+
+GPU_DISCOVERY_OK = 'ok'
+GPU_DISCOVERY_NO_GPU = 'no_gpu'
+GPU_DISCOVERY_UNREACHABLE = 'unreachable'
+GPU_DISCOVERY_NOT_CONFIGURED = 'not_configured'
+GPU_DISCOVERY_ERROR = 'error'
+
+# ssh reserves 255 for its own failures: the remote command never returns it.
+SSH_FAILURE_RETURNCODE = 255
+
+# A PCI address, with or without the domain: '06:00.0' or '0000:06:00.0'.
+PCI_ADDRESS_RE = re.compile(r'^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$')
+
+GpuDiscovery = collections.namedtuple('GpuDiscovery', 'outcome pci_addresses detail')
+
+
+def normalize_pci_address(pci_address):
+    """Drop the default PCI domain: '0000:06:00.0' -> '06:00.0'.
+
+    lspci omits the domain when it is 0000, profiles written by hand may carry
+    it either way, and the two sides have to be compared: one form is needed.
+    A non-default domain is kept, because there the domain is part of the name.
     """
-    # Determine the command for retrieving available PCI addresses
+    if not pci_address:
+        return pci_address
+
+    pci_address = pci_address.strip()
+    parts = pci_address.split(':')
+    if len(parts) == 3 and parts[0] == '0000':
+        return ':'.join(parts[1:])
+    return pci_address
+
+
+def parse_lspci_nvidia(stdout):
+    """Return the PCI addresses in the output of 'lspci | grep NVIDIA'.
+
+    Pure function. Only the first field of a line is taken, and only when it is
+    shaped like a PCI address: ssh banners, motd lines and warnings reach this
+    output too, and none of them is a card.
+    """
+    addresses = set()
+    for line in (stdout or '').splitlines():
+        fields = line.strip().split()
+        if fields and PCI_ADDRESS_RE.match(fields[0]):
+            addresses.add(normalize_pci_address(fields[0]))
+    return sorted(addresses)
+
+
+def classify_gpu_discovery(remote, has_ssh_info, returncode, stdout, stderr):
+    """Turn the result of the discovery command into one of the outcomes above.
+
+    Pure function: it receives what the command returned and decides what that
+    means, so the four cases can be tested without a host to run them on.
+
+    Parameters:
+        remote (str): name of the remote, for the messages.
+        has_ssh_info (bool): whether the remote can be reached at all (True for
+                             'local', which needs no SSH information).
+        returncode (int): exit status of the command, None when it never ran.
+        stdout (str), stderr (str): what it printed.
+
+    Returns:
+        GpuDiscovery: (outcome, PCI addresses, message).
+    """
+    if not has_ssh_info:
+        return GpuDiscovery(GPU_DISCOVERY_NOT_CONFIGURED, [], (
+            f"GPU discovery is not configured for remote '{remote}': no SSH information "
+            f"in REMOTE_TO_IP_INFO_MAP. This is the normal state of a nested (L1) host "
+            f"today; add an entry for the host that enumerates the cards to enable it."
+        ))
+
+    if returncode == SSH_FAILURE_RETURNCODE:
+        return GpuDiscovery(GPU_DISCOVERY_UNREACHABLE, [], (
+            f"Remote '{remote}' is unreachable over SSH, GPU inventory unknown"
+            + (f": {stderr.strip()}" if (stderr or '').strip() else ".")
+        ))
+
+    if returncode == 0:
+        addresses = parse_lspci_nvidia(stdout)
+        if addresses:
+            return GpuDiscovery(GPU_DISCOVERY_OK, addresses, (
+                f"{len(addresses)} NVIDIA card(s) visible on remote '{remote}'."
+            ))
+        return GpuDiscovery(GPU_DISCOVERY_NO_GPU, [], (
+            f"No NVIDIA card is visible on remote '{remote}'."
+        ))
+
+    if returncode == 1 and not (stderr or '').strip():
+        # grep found nothing: the command worked, the host has no NVIDIA card.
+        return GpuDiscovery(GPU_DISCOVERY_NO_GPU, [], (
+            f"No NVIDIA card is visible on remote '{remote}'."
+        ))
+
+    return GpuDiscovery(GPU_DISCOVERY_ERROR, [], (
+        f"GPU discovery failed on remote '{remote}' (exit {returncode})"
+        + (f": {stderr.strip()}" if (stderr or '').strip() else ".")
+    ))
+
+
+def gpu_inventory(remote):
+    """Enumerate the NVIDIA cards physically present on a remote.
+
+    The I/O half of the discovery: it builds and runs the command, locally or
+    over SSH, and hands the result to classify_gpu_discovery. lspci is inventory
+    and physical-existence check only -- usage truth is read from the expanded
+    devices of running instances (Section 2.3), never from here.
+
+    Returns:
+        GpuDiscovery: (outcome, PCI addresses, message).
+    """
     if remote == 'local':
-        try:
-            result = subprocess.run('lspci | grep NVIDIA', capture_output=True, text=True, shell=True)
-            result.check_returncode()
-            available_pci_addresses = [line.split()[0] for line in result.stdout.splitlines()]
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error running lspci locally: {e.stderr.strip()}")
-            return None
+        command = 'lspci | grep NVIDIA'
     else:
-        # Retrieve SSH connection details from REMOTE_TO_IP_INFO_MAP
-        remote_info = REMOTE_TO_IP_INFO_MAP.get(remote)
-        if not remote_info:
-            logger.error(f"No SSH information found for remote '{remote}'.")
-            return None
+        remote_info = REMOTE_TO_IP_INFO_MAP.get(remote) or {}
+        ssh_host = remote_info.get("ssh_host")
+        if not ssh_host:
+            return classify_gpu_discovery(remote, False, None, '', '')
 
         ssh_user = remote_info.get("ssh_user", "ubuntu")
-        ssh_host = remote_info.get("ssh_host")
         ssh_port = remote_info.get("ssh_port", 22)
-        if not ssh_host:
-            logger.error(f"No SSH host specified for remote '{remote}'.")
-            return None
+        command = f"ssh -p {ssh_port} {ssh_user}@{ssh_host} 'lspci | grep NVIDIA'"
 
-        # Build SSH command
-        ssh_command = f"ssh -p {ssh_port} {ssh_user}@{ssh_host} 'lspci | grep NVIDIA'"
-        try:
-            result = subprocess.run(ssh_command, capture_output=True, text=True, shell=True)
-            result.check_returncode()
-            available_pci_addresses = [line.split()[0] for line in result.stdout.splitlines()]
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error running lspci on remote '{remote}': {e.stderr.strip()}")
-            return None
-    return available_pci_addresses
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, shell=True)
+    except Exception as e:
+        return GpuDiscovery(GPU_DISCOVERY_ERROR, [], (
+            f"GPU discovery could not be run for remote '{remote}': {e}"
+        ))
+
+    return classify_gpu_discovery(remote, True, result.returncode, result.stdout, result.stderr)
+
+
+def report_gpu_discovery(discovery):
+    """Log a discovery outcome with the tone the model prescribes.
+
+    A host with no card is not a host in trouble: 'no GPU' is a result, not an
+    error, and the non-interference rule of Section 7 forbids polluting the
+    output of decisions that do not need GPU information at all.
+    """
+    if discovery.outcome in (GPU_DISCOVERY_OK, GPU_DISCOVERY_NO_GPU):
+        return
+    logger.error(discovery.detail)
+
+
+def get_pci_addresses (remote):
+    """Get the PCI addresses of the GPUs available on the remote node.
+
+    Compatibility wrapper over gpu_inventory for the callers that only want the
+    list. None still means "unknown", but a host with no card now returns an
+    empty list instead of a failure, which is what it is.
+
+    Returns:    A list of PCI addresses if the inventory could be read, None otherwise.
+    """
+    discovery = gpu_inventory(remote)
+    report_gpu_discovery(discovery)
+
+    if discovery.outcome in (GPU_DISCOVERY_OK, GPU_DISCOVERY_NO_GPU):
+        return discovery.pci_addresses
+    return None
 
 
 # Canonical name of a GPU profile: gpu-vm-N-PCI or gpu-cnt-N-PCI, where N is the
@@ -1220,6 +1350,85 @@ def gpu_devices_of(devices):
     }
 
 
+def classify_gpu_profile(profile_name, devices):
+    """Read one profile the way the read path prescribes: from its device, not its name.
+
+    Pure function. Section 2.2: the 'gpu-vm-' / 'gpu-cnt-' prefix is policy, and
+    it is binding only when choosing what to attach or detach; the card a profile
+    assigns is always read from the GPU device inside it. A profile named like a
+    GPU profile but shaped like something else is reported and left out of the
+    offer -- never counted, never guessed at.
+
+    Parameters:
+        profile_name (str): the profile name.
+        devices (dict): the profile's devices.
+
+    Returns:
+        tuple: (kind, card index, PCI address, warning).
+               kind is 'vm', 'cnt' or None when the profile is not part of the
+               offer; warning is a sentence to log, or None. A profile whose name
+               does not start with 'gpu-' returns (None, None, None, None): it is
+               not a GPU profile and not figo's business.
+    """
+    if not profile_name.startswith('gpu-'):
+        return None, None, None, None
+
+    pci_addresses = gpu_devices_of(devices)
+    if not pci_addresses:
+        return None, None, None, (
+            "is named like a GPU profile but carries no usable GPU device: ignored"
+        )
+
+    if len(pci_addresses) > 1:
+        return None, None, None, (
+            f"assigns more than one GPU ({', '.join(sorted(pci_addresses))}): only "
+            f"canonical one-card profiles are part of the offer"
+        )
+
+    pci_address = normalize_pci_address(pci_addresses.pop())
+
+    name_match = GPU_PROFILE_NAME_RE.match(profile_name)
+    if not name_match:
+        return None, None, pci_address, (
+            f"assigns GPU {pci_address} but does not follow the 'gpu-vm-N-PCI' / "
+            f"'gpu-cnt-N-PCI' convention: the card it offers cannot be referred to "
+            f"by index and is not part of the offer"
+        )
+
+    kind = 'vm' if name_match.group(1) == 'vm' else 'cnt'
+    return kind, int(name_match.group(2)), pci_address, None
+
+
+def gpu_offer_details(remote):
+    """Return the offer of a remote, keeping the profile that declares each card.
+
+    Same reading as gpu_offer, which is now a view over this one; 'gpu status'
+    needs the profile names as well, and reading the profiles twice to get them
+    would be two chances to disagree.
+
+    Returns:
+        dict: {'vm': {card index: (PCI address, profile name)}, 'cnt': {...}}.
+    """
+    offer = {'vm': {}, 'cnt': {}}
+
+    client = get_remote_client(remote)
+    if not client:
+        logger.error(f"Failed to connect to remote '{remote}'.")
+        return offer
+
+    for profile in client.profiles.all():
+        kind, card_index, pci_address, warning = classify_gpu_profile(
+            profile.name, profile.devices
+        )
+        if warning:
+            logger.warning(f"Profile '{profile.name}' on remote '{remote}' {warning}.")
+        if kind is None:
+            continue
+        offer[kind][card_index] = (pci_address, profile.name)
+
+    return offer
+
+
 def gpu_offer(remote, instance_type):
     """Return the cards a remote offers to an instance type, as {index: pci_address}.
 
@@ -1238,54 +1447,16 @@ def gpu_offer(remote, instance_type):
         dict: {card index (int): PCI address (str)}.
     """
     if instance_type == 'vm':
-        profile_prefix = 'gpu-vm-'
+        kind = 'vm'
     elif instance_type == 'container':
-        profile_prefix = 'gpu-cnt-'
+        kind = 'cnt'
     else:
         raise ValueError("Invalid instance type. Must be 'vm' or 'container'.")
 
-    client = get_remote_client(remote)
-    if not client:
-        logger.error(f"Failed to connect to remote '{remote}'.")
-        return {}
-
-    offer = {}
-    for profile in client.profiles.all():
-        if not profile.name.startswith('gpu-'):
-            continue
-
-        pci_addresses = gpu_devices_of(profile.devices)
-        if not pci_addresses:
-            logger.warning(
-                f"Profile '{profile.name}' on remote '{remote}' is named like a GPU "
-                f"profile but carries no usable GPU device: ignored."
-            )
-            continue
-
-        if not profile.name.startswith(profile_prefix):
-            continue
-
-        name_match = GPU_PROFILE_NAME_RE.match(profile.name)
-        if not name_match:
-            logger.warning(
-                f"Profile '{profile.name}' on remote '{remote}' does not follow the "
-                f"'{profile_prefix}N-PCI' convention: the card it assigns cannot be "
-                f"referred to by index."
-            )
-            continue
-
-        if len(pci_addresses) > 1:
-            logger.warning(
-                f"Profile '{profile.name}' on remote '{remote}' assigns more than one "
-                f"GPU ({', '.join(sorted(pci_addresses))}): only canonical one-card "
-                f"profiles are part of the offer."
-            )
-            continue
-
-        card_index = int(name_match.group(2))
-        offer[card_index] = pci_addresses.pop()
-
-    return offer
+    return {
+        card_index: pci_address
+        for card_index, (pci_address, _profile_name) in gpu_offer_details(remote)[kind].items()
+    }
 
 
 def gpu_holders(remote):
@@ -1318,6 +1489,159 @@ def gpu_holders(remote):
             holders.setdefault(pci_address, []).append((project_name, instance.name))
 
     return vm_holders, container_holders
+
+
+def gpu_usage_by_card(remote):
+    """Return every instance that references a card on a remote, whatever its state.
+
+    Companion of gpu_holders, which answers the start-time question -- who holds
+    this card *right now*. Here stopped instances count too: because figo releases
+    resources on stop, what is merely assigned today is what will contend at the
+    next start, and that is the difference between the RUNNING and the ASSIGNED
+    column of 'gpu status'.
+
+    Parameters:
+        remote (str): name of the remote.
+
+    Returns:
+        dict: {PCI address: [(project, instance name, state, 'vm'|'container'), ...]}.
+    """
+    usage = {}
+
+    for project_name, instance in iterator_over_instances(remote):
+        instance_type = 'vm' if instance.type == "virtual-machine" else 'container'
+        for pci_address in gpu_devices_of(instance.expanded_devices):
+            usage.setdefault(normalize_pci_address(pci_address), []).append(
+                (project_name, instance.name, instance.status, instance_type)
+            )
+
+    return usage
+
+
+GpuStatusRow = collections.namedtuple(
+    'GpuStatusRow', 'card_index pci cnt_profile vm_profile running assigned held_by note'
+)
+
+
+def build_gpu_status_rows(offer_details, inventory_pci_addresses, usage):
+    """Build the per-card rows of 'figo gpu status'.
+
+    Pure function: it receives the offer (which cards are offered, to whom, by
+    which profile), the physical inventory read from lspci, and who is using
+    what, and merges them into one row per card. The three sources disagree in
+    ways that matter, and the row is where that shows: a card can be offered and
+    absent (profile left behind after a hardware change), present and not offered
+    (assigned by hand, or reserved), used and not offered (the same, seen through
+    a running instance).
+
+    Parameters:
+        offer_details (dict): {'vm': {index: (pci, profile)}, 'cnt': {...}}.
+        inventory_pci_addresses (list or None): what lspci saw; None when the
+                                                inventory could not be read at
+                                                all, which is a different thing
+                                                from an empty one.
+        usage (dict): {pci: [(project, name, state, type), ...]}, from gpu_usage_by_card.
+
+    Returns:
+        tuple: (rows, notes). rows are GpuStatusRow, cards of the offer first in
+               index order, then the cards outside it in PCI order; notes are
+               sentences about inconsistencies found while merging.
+    """
+    notes = []
+    cards = {}
+
+    def card_of(pci_address):
+        return cards.setdefault(pci_address, {'index': None, 'vm': None, 'cnt': None})
+
+    for kind in ('cnt', 'vm'):
+        for card_index, (pci_address, profile_name) in sorted(offer_details.get(kind, {}).items()):
+            card = card_of(pci_address)
+            card[kind] = profile_name
+            if card['index'] is None:
+                card['index'] = card_index
+            elif card['index'] != card_index:
+                notes.append(
+                    f"GPU {pci_address} is offered under two different card indexes "
+                    f"({card['index']} and {card_index}): the vm and cnt profiles of a "
+                    f"card are meant to carry the same index."
+                )
+
+    index_owner = {}
+    for pci_address, card in cards.items():
+        if card['index'] is None:
+            continue
+        if card['index'] in index_owner and index_owner[card['index']] != pci_address:
+            notes.append(
+                f"Card index {card['index']} is used by two different GPUs "
+                f"({index_owner[card['index']]} and {pci_address}): indexes are meant "
+                f"to name one card each."
+            )
+        index_owner.setdefault(card['index'], pci_address)
+
+    inventory = set(inventory_pci_addresses or [])
+    for pci_address in inventory:
+        card_of(pci_address)
+    for pci_address in usage:
+        card_of(pci_address)
+
+    rows = []
+    for pci_address, card in cards.items():
+        holders = usage.get(pci_address, [])
+
+        running_containers = [h for h in holders if h[3] == 'container' and h[2] == "Running"]
+        running_vms = [h for h in holders if h[3] == 'vm' and h[2] == "Running"]
+
+        if running_vms:
+            held_by = ", ".join(
+                f"VM '{name}' ({project}, vfio)"
+                for project, name, _state, _type in sorted(running_vms, key=lambda h: (h[1], h[0]))
+            )
+        else:
+            held_by = "-"
+
+        note = []
+        if card['index'] is None:
+            note.append("not offered")
+        if inventory_pci_addresses is not None and pci_address not in inventory:
+            note.append("not in lspci")
+
+        rows.append(GpuStatusRow(
+            card_index=card['index'],
+            pci=pci_address,
+            cnt_profile=card['cnt'] or "-",
+            vm_profile=card['vm'] or "-",
+            running=len(running_containers),
+            assigned=len(holders),
+            held_by=held_by,
+            note=", ".join(note),
+        ))
+
+    rows.sort(key=lambda row: (row.card_index is None, row.card_index or 0, row.pci))
+    return rows, notes
+
+
+def format_gpu_card_instances(row, usage):
+    """Render the instance list of one card for 'gpu status -i'.
+
+    Running instances first, because they are the ones holding the card; the
+    others follow, since release-on-stop makes them the contention of the next
+    start rather than of now.
+
+    Returns:
+        str: one line, or the card with an explicit '-' when nothing uses it.
+    """
+    label = f"CARD {row.card_index if row.card_index is not None else '-'} ({row.pci}):"
+    holders = usage.get(row.pci, [])
+    if not holders:
+        return f"{label}  -"
+
+    # The state is upper-cased as it is in the refusal message of Section 4: in a
+    # line about contention, the state is the load-bearing word.
+    ordered = sorted(holders, key=lambda h: (h[2] != "Running", h[1], h[0]))
+    rendered = ", ".join(
+        f"{name} ({project}, {state.upper()})" for project, name, state, _type in ordered
+    )
+    return f"{label}  {rendered}"
 
 
 def gpu_start_decision(requested, vm_holders, container_holders, instance_type):
@@ -2623,43 +2947,74 @@ def exec_instance_bash(instance_name, remote, project, force=False, timeout=BASH
 ###### figo gpu command functions ###########
 #############################################
 
-def show_gpu_status(remote, extend=False):
-    """Show the status of GPUs on the remote node. 
-    
-    (the remote node is also implicitly associated with the client).
-    
-    It uses lspci to count NVIDIA GPUs
-    It checks the total number of GPUs, the number of available GPUs, and the active GPU profiles.
+def show_gpu_status(remote, extend=False, instances=False):
+    """Show the GPUs of a remote, one row per card.
+
+    Section 5.3. The single row of aggregate counters it replaces could not be
+    right: it counted profiles instead of cards, so a card shared by two
+    containers counted twice, and it said nothing about *which* card was free,
+    nor to whom -- a card offered only to containers is not available to a VM,
+    however free it is.
+
+    The three sources are merged by build_gpu_status_rows: the offer (profiles),
+    the physical inventory (lspci) and the usage (expanded devices of the
+    instances, all projects, every state). When the inventory cannot be read the
+    table is still built from the other two, with a note saying what is missing:
+    an L1 host, where discovery does not work yet, must still show its cards.
 
     Args:
     - remote: The remote server name.
     - extend: If True, adapt the output column width to the content.
-
+    - instances: If True, list the instances of each card under the table.
     """
-    
-    available_pci_addresses = get_pci_addresses(remote)
-    if available_pci_addresses is None:
-        logger.error(f"Failed to retrieve available PCI addresses from remote '{remote}'.")
-        return []
-    total_gpus = len(available_pci_addresses)
+    discovery = gpu_inventory(remote)
+    report_gpu_discovery(discovery)
 
-    # The following code correctly considers all the instances in all projects on the remote
+    inventory_pci_addresses = (
+        discovery.pci_addresses
+        if discovery.outcome in (GPU_DISCOVERY_OK, GPU_DISCOVERY_NO_GPU)
+        else None
+    )
 
-    running_instances_couple = [
-        i for i in iterator_over_instances(remote) if i[1].status == "Running"
-    ]
-    active_gpu_profiles = [
-        profile for my_profile, my_instance in running_instances_couple for profile in my_instance.profiles
-        if profile.startswith("gpu-")
-    ]
+    offer_details = gpu_offer_details(remote)
+    usage = gpu_usage_by_card(remote)
 
-    available_gpus = total_gpus - len(active_gpu_profiles)
+    rows, notes = build_gpu_status_rows(offer_details, inventory_pci_addresses, usage)
 
-    gpu_profiles_str = ", ".join(active_gpu_profiles)
-    COLS = [('TOTAL', 10), ('AVAILABLE', 10), ('ACTIVE', 10), ('PROFILES', 40)]
+    COLS = [('CARD', 5), ('PCI', 9), ('CNT-PROFILE', 17), ('VM-PROFILE', 17),
+            ('RUNNING', 8), ('ASSIGNED', 9), ('HELD BY', 38), ('NOTE', 14)]
     add_header_line_to_output(COLS)
-    add_row_to_output(COLS, [str(total_gpus), str(available_gpus), str(len(active_gpu_profiles)), gpu_profiles_str])
+    for row in rows:
+        add_row_to_output(COLS, [
+            str(row.card_index) if row.card_index is not None else "-",
+            row.pci,
+            row.cnt_profile,
+            row.vm_profile,
+            str(row.running),
+            str(row.assigned),
+            row.held_by,
+            row.note,
+        ])
     flush_output(extend=extend)
+
+    if not rows:
+        logger.info(f"No GPU is offered, present or in use on remote '{remote}'.")
+
+    if instances:
+        print()
+        for row in rows:
+            print(format_gpu_card_instances(row, usage))
+
+    if inventory_pci_addresses is None:
+        logger.warning(
+            f"Physical inventory unavailable on remote '{remote}': the table shows the "
+            f"cards known from profiles and instances, and a card present but neither "
+            f"offered nor in use cannot appear."
+        )
+
+    for note in notes:
+        logger.warning(note)
+
 
 def list_gpu_profiles(client, extend=False):
     """List all GPU profiles on the remote node implicitly associated with the client.
@@ -2847,20 +3202,29 @@ def remove_gpu_profile(instance_name, remote='local', project='default'):
         return False
 
 def show_gpu_pci_addresses(remote='local'):
-    """Return the PCI addresses of the GPUs on the remote node."""
-    try:
-        logger.info(f"Getting PCI addresses of GPUs on remote '{remote}'...")
+    """Print the PCI addresses of the NVIDIA cards physically present on a remote.
 
-        logger.info (get_pci_addresses(remote))
-        
+    Section 7 applies here as well: a host with no card answered the question and
+    returns True, while unreachable, not configured and failed are reported for
+    what they are. The previous version printed the raw Python list -- 'None'
+    included -- which said nothing about which of the four had happened.
+
+    Returns:    True if the inventory could be read, False otherwise.
+    """
+    discovery = gpu_inventory(remote)
+    report_gpu_discovery(discovery)
+
+    if discovery.outcome == GPU_DISCOVERY_OK:
+        logger.info(
+            f"GPUs on remote '{remote}': {', '.join(discovery.pci_addresses)}"
+        )
         return True
-    
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to get PCI addresses of GPUs on remote '{remote}': {e.stderr.strip()}")
-        return False
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while getting PCI addresses of GPUs on remote '{remote}': {e}")
-        return False
+
+    if discovery.outcome == GPU_DISCOVERY_NO_GPU:
+        logger.info(discovery.detail)
+        return True
+
+    return False
 
 
 #############################################
@@ -6575,13 +6939,17 @@ def create_gpu_parser(subparsers):
     status_gpu_parser = gpu_subparsers.add_parser(
         "status",
         help="Show the current status of GPUs, including their availability and usage.",
-        description="Show the status of GPUs on a specified remote, displaying their availability and usage.\n"
+        description="Show the GPUs of a remote, one row per card: which profiles offer it to\n"
+                    "containers and to VMs, how many running containers use it, how many\n"
+                    "instances are assigned to it in any state, and the VM holding it, if any.\n"
                     "If no remote is specified, defaults to 'local'.\n"
-                    "Use the -e/--extend option to adjust column width for better readability.",
+                    "Use -i/--instances to list the instances of each card, and -e/--extend to\n"
+                    "adjust column width for better readability.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
                "  figo gpu status\n"
                "  figo gpu status my_remote:\n"
+               "  figo gpu status my_remote: -i\n"
                "  figo gpu status --extend"
     )
     status_gpu_parser.add_argument(
@@ -6592,6 +6960,10 @@ def create_gpu_parser(subparsers):
     )
     status_gpu_parser.add_argument(
         "-e", "--extend", action="store_true", help="Extend column width to fit the content"
+    )
+    status_gpu_parser.add_argument(
+        "-i", "--instances", action="store_true",
+        help="List, under the table, the instances assigned to each card"
     )
 
     # List GPU profiles with optional remote
@@ -6728,7 +7100,7 @@ def handle_gpu_command(args, parser_dict):
 
         client = get_remote_client(remote)
         if client:
-            show_gpu_status(remote, extend=args.extend)
+            show_gpu_status(remote, extend=args.extend, instances=args.instances)
         else:
             logger.error(f"Failed to retrieve GPU status for remote '{remote}'.")
     elif args.gpu_command in ["list", "l"]:
@@ -6804,11 +7176,10 @@ def handle_gpu_command(args, parser_dict):
                 logger.error(f"Error: Invalid remote name '{remote}'.")
                 return
 
-            # Retrieve PCI addresses for GPUs available on the remote
-            my_result = show_gpu_pci_addresses(remote)
-
-            if not my_result:
-                logger.error(f"Failed to retrieve PCI addresses for GPUs on remote '{remote}'.")
+            # Retrieve PCI addresses for GPUs available on the remote. The reason of
+            # a failure -- unreachable, not configured, command error -- has already
+            # been reported by the discovery: a generic line on top would bury it.
+            show_gpu_pci_addresses(remote)
 
 
 
