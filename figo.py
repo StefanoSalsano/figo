@@ -7360,6 +7360,219 @@ def handle_instance_command(args, parser_dict):
 ###### figo gpu command CLI #################
 #############################################
 
+# --- The default-gateway invariant (Section 3.3) ----------------------------
+#
+# An instance reached through a floating IP must have the serving gw-float as
+# its default gateway: the return path goes back through the gateway, where
+# conntrack knows the flow. The value is read *per instance* and never deduced
+# from the subnet -- measured on 2026-08-26, instances on the same subnet have
+# different default gateways depending on whether they hold a floating IP.
+
+FLOAT_INVARIANT_OK = 'ok'
+FLOAT_INVARIANT_VIOLATED = 'violated'
+FLOAT_INVARIANT_UNKNOWN = 'unknown'
+FLOAT_INVARIANT_NOT_CHECKED = 'not_checked'
+
+GATEWAY_READ_OK = 'ok'
+GATEWAY_READ_UNAVAILABLE = 'unavailable'
+GATEWAY_READ_ERROR = 'error'
+
+DefaultGatewayRead = collections.namedtuple('DefaultGatewayRead', 'outcome gateways detail')
+
+
+def parse_default_gateways(stdout):
+    """Return the gateways named by the output of 'ip route show default'.
+
+    Pure function. A list, not a single value: more than one default route is
+    unusual and is exactly the kind of thing worth showing rather than
+    collapsing into the first entry.
+    """
+    gateways = []
+    for line in (stdout or '').splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == 'default' and fields[1] == 'via':
+            gateways.append(fields[2])
+    return gateways
+
+
+def classify_default_gateway_read(scope, returncode, stdout, stderr):
+    """Turn the result of reading an instance's default route into an outcome.
+
+    Pure function. 'The instance did not answer' is not 'the instance has no
+    default gateway': a stopped instance, a virtual machine without the incus
+    agent and a genuine failure all leave the invariant *unknown*, and reporting
+    unknown as a violation would produce false alarms on instances that are
+    perfectly fine.
+    """
+    error_text = (stderr or '').strip()
+
+    if returncode == 0:
+        gateways = parse_default_gateways(stdout)
+        if not gateways:
+            return DefaultGatewayRead(GATEWAY_READ_OK, [], (
+                f"'{scope}' has no default route."
+            ))
+        return DefaultGatewayRead(GATEWAY_READ_OK, gateways, (
+            f"'{scope}' routes by default via {', '.join(gateways)}."
+        ))
+
+    lowered = error_text.lower()
+    if ('not running' in lowered or 'instance is not running' in lowered
+            or 'agent' in lowered or 'instance not found' in lowered):
+        return DefaultGatewayRead(GATEWAY_READ_UNAVAILABLE, [], (
+            f"Cannot read the default route of '{scope}': {error_text}"
+        ))
+
+    return DefaultGatewayRead(GATEWAY_READ_ERROR, [], (
+        f"Reading the default route of '{scope}' failed (exit {returncode})"
+        + (f": {error_text}" if error_text else ".")
+    ))
+
+
+def probe_default_gateway(scope):
+    """Read the default gateway of an instance. Read-only.
+
+    Runs 'ip route show default' inside the instance and nothing else.
+    """
+    argv = incus_exec_argv(scope, ['ip', 'route', 'show', 'default'])
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True)
+    except Exception as e:
+        return DefaultGatewayRead(GATEWAY_READ_ERROR, [], (
+            f"Could not read the default route of '{scope}': {e}"
+        ))
+
+    return classify_default_gateway_read(scope, result.returncode, result.stdout, result.stderr)
+
+
+def float_invariant_status(mapping, instance, gateway_read, expected_gateway):
+    """Decide whether an instance still satisfies the default-gateway invariant.
+
+    Pure function.
+
+    Parameters:
+        mapping (dict): the floating-IP mapping, from parse_floating_ip_list.
+        instance (dict): the holding instance, or None if no instance holds the
+                         private address.
+        gateway_read (DefaultGatewayRead): the result of reading its route, or None.
+        expected_gateway (str): the address of the gw-float serving the subnet.
+
+    Returns:
+        tuple: (status, detail).
+    """
+    if not (mapping.get('enabled') or mapping.get('active')):
+        return FLOAT_INVARIANT_NOT_CHECKED, (
+            f"{mapping['public']} is neither enabled nor active: the invariant does "
+            f"not apply until it is turned on."
+        )
+
+    if instance is None:
+        return FLOAT_INVARIANT_UNKNOWN, (
+            f"No instance figo knows holds {mapping['private']}, so its default "
+            f"gateway cannot be checked."
+        )
+
+    if gateway_read is None or gateway_read.outcome != GATEWAY_READ_OK:
+        detail = gateway_read.detail if gateway_read else "the route was not read"
+        return FLOAT_INVARIANT_UNKNOWN, (
+            f"Cannot tell whether '{instance['name']}' satisfies the invariant: {detail}"
+        )
+
+    if not gateway_read.gateways:
+        return FLOAT_INVARIANT_VIOLATED, (
+            f"'{instance['name']}' has no default route, so traffic returning through "
+            f"{mapping['public']} cannot reach the gateway."
+        )
+
+    if expected_gateway and expected_gateway not in gateway_read.gateways:
+        return FLOAT_INVARIANT_VIOLATED, (
+            f"'{instance['name']}' routes by default via "
+            f"{', '.join(gateway_read.gateways)}, not via the gateway "
+            f"{expected_gateway} that serves {mapping['public']}: the return path "
+            f"does not pass through the gateway, so the mapping cannot work."
+        )
+
+    return FLOAT_INVARIANT_OK, (
+        f"'{instance['name']}' routes by default via {expected_gateway}."
+    )
+
+
+def index_instances_by_address(instance_records):
+    """Index instances by every private address they hold.
+
+    Pure function. 'Holds' includes the addresses declared in the instance's
+    network configuration *and* those recorded as additional (nested VMs, inner
+    containers, extra addresses on the NIC): a floating IP can point at any of
+    them, and an index built on the first kind alone would report a mapping as
+    orphaned when it is not.
+
+    Returns:
+        tuple: (index, warnings) where index is {address: [record, ...]}.
+    """
+    index = {}
+    warnings = []
+
+    for record in instance_records or []:
+        for address in list(record.get('addresses') or []) + list(record.get('additional') or []):
+            address = str(address).split('/')[0]
+            holders = index.setdefault(address, [])
+            holders.append(record)
+            if len(holders) == 2:
+                names = ", ".join(f"'{holder['name']}'" for holder in holders)
+                warnings.append(
+                    f"Address {address} is claimed by more than one instance ({names}): "
+                    f"figo reports the first, but the duplicate is worth fixing."
+                )
+
+    return index, warnings
+
+
+def build_float_rows(mappings, address_index):
+    """Join the gateway's mappings with the instances figo knows.
+
+    Pure function. Every mapping produces a row, including one whose private
+    address belongs to no instance figo can see: an orphaned mapping is a fact
+    about the gateway, and dropping it would hide it.
+
+    Returns:
+        list: one dict per mapping, with the mapping fields plus 'instance'.
+    """
+    rows = []
+    for mapping in mappings or []:
+        holders = address_index.get(mapping.get('private')) or []
+        row = dict(mapping)
+        row['instance'] = holders[0] if holders else None
+        rows.append(row)
+    return rows
+
+
+def collect_instance_records(remote):
+    """Collect what figo knows about the instances of a remote. Read-only.
+
+    Returns:
+        list: dicts with name, project, scope, status, type, addresses, additional.
+    """
+    records = []
+
+    for project_name, instance in iterator_over_instances(remote):
+        config = getattr(instance, 'config', None) or {}
+        # get_ip_device_pairs reads a mapping; a pylxd object exposes .config.
+        addresses = get_ip_addresses({'config': config, 'name': instance.name})
+        additional = [entry['ip'] for entry in get_additional_ips_from_config(config)]
+
+        records.append({
+            'name': instance.name,
+            'project': project_name,
+            'scope': f"{remote}:{project_name}.{instance.name}",
+            'status': instance.status,
+            'type': 'vm' if instance.type == "virtual-machine" else 'container',
+            'addresses': addresses,
+            'additional': additional,
+        })
+
+    return records
+
+
 #############################################
 ###### figo net command functions       #####
 #############################################
@@ -7480,6 +7693,186 @@ def show_gateway_status(remote=None, extend=False):
         logger.warning(warning)
 
 
+def gather_float_state(remote):
+    """Read the floating-IP state of a remote and join it with what figo knows.
+
+    Read-only throughout: 'floating-ip list' on the gateway, the instance list
+    through the API, and 'ip route show default' inside the instances that hold
+    a live mapping. Nothing is applied, nothing is written.
+
+    Returns:
+        tuple: (rows, gateway_address, probe, warnings). rows carry the mapping,
+               the holding instance and the invariant verdict.
+    """
+    subnets, gateways, warnings = figo_network()
+
+    serving = {
+        subnet: gateway for subnet, gateway in gateways.items()
+        if gateway['scope'].split(':')[0] == remote
+    }
+    if not serving:
+        return [], None, None, warnings + [
+            f"No floating-IP gateway is configured on remote '{remote}': declare it "
+            f"under network.float_gateways in {CONFIG_FILE}."
+        ]
+
+    subnet = sorted(serving)[0]
+    gateway = serving[subnet]
+    if len(serving) > 1:
+        warnings.append(
+            f"Remote '{remote}' has more than one gateway configured; reporting "
+            f"'{gateway['scope']}' for subnet {subnet}."
+        )
+
+    probe = probe_gateway(gateway['scope'])
+    if probe.outcome != GATEWAY_PROBE_OK:
+        return [], gateway.get('address'), probe, warnings
+
+    records = collect_instance_records(remote)
+    address_index, index_warnings = index_instances_by_address(records)
+    warnings.extend(index_warnings)
+
+    rows = build_float_rows(probe.mappings, address_index)
+
+    for row in rows:
+        instance = row['instance']
+        gateway_read = None
+        # The route is read only where the verdict can differ: a mapping that is
+        # neither enabled nor active does not need it, and an instance that is not
+        # running cannot answer.
+        if (row.get('enabled') or row.get('active')) and instance and instance['status'] == "Running":
+            gateway_read = probe_default_gateway(instance['scope'])
+        row['invariant'], row['invariant_detail'] = float_invariant_status(
+            row, instance, gateway_read, gateway.get('address')
+        )
+
+    return rows, gateway.get('address'), probe, warnings
+
+
+def float_row_as_dict(row):
+    """Render one row for --json: no objects, no tuples, stable key names."""
+    instance = row.get('instance') or {}
+    return {
+        'public': row.get('public'),
+        'private': row.get('private'),
+        'enabled': row.get('enabled'),
+        'active': row.get('active'),
+        'mode': row.get('mode'),
+        'tcp': [{'pub_port': pub, 'priv_port': priv} for pub, priv in row.get('tcp') or []],
+        'udp': [{'pub_port': pub, 'priv_port': priv} for pub, priv in row.get('udp') or []],
+        'icmp': row.get('icmp') or [],
+        'instance': instance.get('name'),
+        'project': instance.get('project'),
+        'status': instance.get('status'),
+        'invariant': row.get('invariant'),
+        'invariant_detail': row.get('invariant_detail'),
+    }
+
+
+def show_float_list(remote, as_json=False, extend=False):
+    """List the floating IPs of a remote, joined with the instances holding them."""
+    rows, _gateway_address, probe, warnings = gather_float_state(remote)
+
+    if probe is not None and probe.outcome != GATEWAY_PROBE_OK:
+        logger.error(probe.detail)
+        return
+
+    if as_json:
+        print(json.dumps([float_row_as_dict(row) for row in rows], indent=2))
+    else:
+        COLS = [('PUBLIC IP', 16), ('PRIVATE IP', 15), ('INSTANCE', 16), ('PROJECT', 18),
+                ('STATE', 8), ('ENABLED', 8), ('ACTIVE', 7), ('INVARIANT', 12)]
+        add_header_line_to_output(COLS)
+        for row in rows:
+            instance = row.get('instance') or {}
+            add_row_to_output(COLS, [
+                row.get('public') or "-",
+                row.get('private') or "-",
+                instance.get('name') or "-",
+                instance.get('project') or "-",
+                (instance.get('status') or "-")[:3].lower(),
+                "yes" if row.get('enabled') else "no",
+                "yes" if row.get('active') else "no",
+                row.get('invariant') or "-",
+            ])
+        flush_output(extend=extend)
+
+        if not rows:
+            logger.info(f"The gateway on '{remote}' holds no floating-IP mapping.")
+
+    # The point of the join is what it finds wrong; say it out loud rather than
+    # leaving it to whoever reads a column.
+    for row in rows:
+        if row.get('enabled') != row.get('active'):
+            logger.warning(
+                f"Drift on {row['public']}: enabled={row['enabled']} but "
+                f"active={row['active']} -- the configuration and the interface "
+                f"disagree, someone edited without applying."
+            )
+        if row.get('invariant') == FLOAT_INVARIANT_VIOLATED:
+            logger.warning(row['invariant_detail'])
+        elif row.get('invariant') == FLOAT_INVARIANT_UNKNOWN:
+            logger.info(row['invariant_detail'])
+
+    for warning in warnings:
+        logger.warning(warning)
+
+
+def show_float_show(remote, public_ip, as_json=False, extend=False):
+    """Show one floating IP in full: ports, holder, invariant."""
+    rows, _gateway_address, probe, warnings = gather_float_state(remote)
+
+    if probe is not None and probe.outcome != GATEWAY_PROBE_OK:
+        logger.error(probe.detail)
+        return
+
+    matching = [row for row in rows if row.get('public') == public_ip]
+    if not matching:
+        known = ", ".join(sorted(row.get('public') or "" for row in rows)) or "none"
+        logger.error(
+            f"No mapping for {public_ip} on the gateway of '{remote}'. Known: {known}."
+        )
+        return
+
+    row = matching[0]
+    if as_json:
+        print(json.dumps(float_row_as_dict(row), indent=2))
+        return
+
+    instance = row.get('instance') or {}
+    ports = ", ".join(
+        f"{pub}->{priv}" for pub, priv in row.get('tcp') or []
+    ) or "-"
+    udp_ports = ", ".join(
+        f"{pub}->{priv}" for pub, priv in row.get('udp') or []
+    ) or "-"
+
+    COLS = [('FIELD', 18), ('VALUE', 62)]
+    add_header_line_to_output(COLS)
+    for field, value in [
+        ('public ip', row.get('public') or "-"),
+        ('private ip', row.get('private') or "-"),
+        ('instance', instance.get('name') or "-"),
+        ('project', instance.get('project') or "-"),
+        ('state', instance.get('status') or "-"),
+        ('enabled', "yes" if row.get('enabled') else "no"),
+        ('active', "yes" if row.get('active') else "no"),
+        ('mode', row.get('mode') or "-"),
+        ('tcp', ports),
+        ('udp', udp_ports),
+        ('icmp', ", ".join(row.get('icmp') or []) or "-"),
+        ('invariant', row.get('invariant') or "-"),
+    ]:
+        add_row_to_output(COLS, [field, str(value)])
+    flush_output(extend=extend)
+
+    print()
+    print(row.get('invariant_detail') or "")
+
+    for warning in warnings:
+        logger.warning(warning)
+
+
 def create_net_parser(subparsers):
     net_parser = subparsers.add_parser(
         "net",
@@ -7532,6 +7925,62 @@ def create_net_parser(subparsers):
         help="Restrict to the gateways hosted on this remote."
     )
     gateway_status_parser.add_argument(
+        "-e", "--extend", action="store_true", help="Extend column width to fit the content"
+    )
+
+    float_parser = net_subparsers.add_parser(
+        "float",
+        help="Public (floating) IP mappings held by the gateways.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    float_subparsers = float_parser.add_subparsers(dest="float_command")
+
+    float_list_parser = float_subparsers.add_parser(
+        "list",
+        aliases=["l"],
+        help="List the floating IPs and the instances holding them.",
+        description="Read the mappings from the gateway serving a remote and join them\n"
+                    "with what figo knows: holding instance, project, state. Reports\n"
+                    "'enabled' (what the configuration asks) against 'active' (what is on\n"
+                    "the interface), and whether each instance still satisfies the\n"
+                    "default-gateway invariant. Read-only.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float list blade3\n"
+               "  figo net float list blade3 --json"
+    )
+    float_list_parser.add_argument(
+        "remote", nargs="?", default="blade3",
+        help="Remote whose gateway to read. Defaults to 'blade3'."
+    )
+    float_list_parser.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit JSON instead of a table"
+    )
+    float_list_parser.add_argument(
+        "-e", "--extend", action="store_true", help="Extend column width to fit the content"
+    )
+
+    float_show_parser = float_subparsers.add_parser(
+        "show",
+        aliases=["s"],
+        help="Show one floating IP in full.",
+        description="Ports, holding instance and invariant status of a single mapping.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float show 160.80.105.35\n"
+               "  figo net float show 160.80.105.35 --json"
+    )
+    float_show_parser.add_argument("public_ip", help="The public address of the mapping")
+    float_show_parser.add_argument(
+        "-r", "--remote", default="blade3",
+        help="Remote whose gateway to read. Defaults to 'blade3'."
+    )
+    float_show_parser.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit JSON instead of a table"
+    )
+    float_show_parser.add_argument(
         "-e", "--extend", action="store_true", help="Extend column width to fit the content"
     )
 
@@ -7715,6 +8164,16 @@ def handle_net_command(args, parser_dict):
             show_gateway_list(extend=args.extend)
         elif args.gateway_command == "status":
             show_gateway_status(remote=fix_remote_name(args.remote), extend=args.extend)
+
+    elif args.net_command == "float":
+        if not args.float_command:
+            parser_dict['net_parser'].print_help()
+        elif args.float_command in ["list", "l"]:
+            show_float_list(fix_remote_name(args.remote), as_json=args.as_json,
+                            extend=args.extend)
+        elif args.float_command in ["show", "s"]:
+            show_float_show(fix_remote_name(args.remote), args.public_ip,
+                            as_json=args.as_json, extend=args.extend)
 
 
 def handle_gpu_command(args, parser_dict):
