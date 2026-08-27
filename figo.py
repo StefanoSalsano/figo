@@ -81,9 +81,6 @@ CERTIFICATE_DIR = "./certs"
 # Base IP address to start the IP address generation for WireGuard VPN clients
 BASE_IP_FOR_WG_VPN = "10.202.1.15"
 
-# WireGuard public key of the VPN server 
-PublicKey = "rdM5suGD/hTHdStf/K1SVc4rviUcUQbKnARnw0AAwT8="
-
 # Allowed IP addresses for the VPN server
 AllowedIPs = "10.192.0.0/10"
 
