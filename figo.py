@@ -3979,6 +3979,43 @@ def get_wg_client_ip_address(ip_next=False):
                 next_ip = ipaddress.ip_address(BASE_IP_FOR_WG_VPN)
     return str(next_ip)
 
+def format_wireguard_client_config(private_key, ip_address, server_public_key=None,
+                                   allowed_ips=None, endpoint=None):
+    """Render the WireGuard client configuration handed to a user.
+
+    Pure function: facts in, text out, so that the file a user receives can be
+    frozen by a test. The [Peer] section is deployment configuration -- server
+    key, allowed range, endpoint -- and a silent change there produces a client
+    that looks configured and cannot connect, which is exactly the failure the
+    duplicated server key made possible before it was removed.
+
+    The three peer values default to the module constants; they are parameters
+    so that a test can render the file without depending on this installation.
+
+    Parameters:
+        private_key (str): the client's private key.
+        ip_address (str): the client's address inside the VPN, without prefix.
+        server_public_key (str), allowed_ips (str), endpoint (str): the peer,
+            defaulting to WG_SERVER_PUB_KEY, AllowedIPs and Endpoint.
+
+    Returns:
+        str: the content of the .conf file.
+    """
+    server_public_key = WG_SERVER_PUB_KEY if server_public_key is None else server_public_key
+    allowed_ips = AllowedIPs if allowed_ips is None else allowed_ips
+    endpoint = Endpoint if endpoint is None else endpoint
+
+    return f"""[Interface]
+PrivateKey = {private_key}
+Address = {ip_address}/24
+
+[Peer]
+PublicKey = {server_public_key}
+AllowedIPs = {allowed_ips}
+Endpoint = {endpoint}
+"""
+
+
 def generate_wireguard_config(username, ip_address=None, ip_next=False):
     """
     Generate WireGuard configuration for a user, saving both the private key in the config file
@@ -4006,16 +4043,7 @@ def generate_wireguard_config(username, ip_address=None, ip_next=False):
         private_key = subprocess.check_output(f"wg genkey | tee {key_file}", shell=True).decode('utf-8').strip()
         public_key = subprocess.check_output(f"wg pubkey < {key_file}", shell=True).decode('utf-8').strip()
 
-        # WireGuard configuration template
-        config_content = f"""[Interface]
-PrivateKey = {private_key}
-Address = {ip_address}/24
-
-[Peer]
-PublicKey = {WG_SERVER_PUB_KEY}
-AllowedIPs = {AllowedIPs}
-Endpoint = {Endpoint}
-"""
+        config_content = format_wireguard_client_config(private_key, ip_address)
         directory = os.path.expanduser(USER_DIR)
 
         # Ensure the directory exists
