@@ -75,6 +75,12 @@ NAME_SERVER_IP_ADDR_2 = "8.8.4.4"
 PROFILE_DIR = "./profiles"
 USER_DIR = "./users"
 
+# Deployment configuration: the facts about *this* installation, which do not
+# belong in the source. The file is optional -- with no file figo behaves
+# exactly as it did before it existed -- and 'config.yaml.example' in the
+# repository documents its shape. See figo-network-model.md Section 5.2.
+CONFIG_FILE = "./config.yaml"
+
 # Directory that contains the remote node certificates
 CERTIFICATE_DIR = "./certs"
 
@@ -1299,6 +1305,412 @@ def report_gpu_discovery(discovery):
     if discovery.outcome in (GPU_DISCOVERY_OK, GPU_DISCOVERY_NO_GPU):
         return
     logger.error(discovery.detail)
+
+
+# --- Deployment configuration ----------------------------------------------
+
+def load_figo_config(path=None):
+    """Read the deployment configuration file, or return an empty configuration.
+
+    A missing file is the normal case, not an error: everything figo reads from
+    here has a fallback in the source, so an installation that never creates the
+    file behaves exactly as before. A file that exists and cannot be parsed is a
+    different matter and is reported, because silently ignoring it would make
+    figo run with settings the administrator believes are in force.
+
+    Parameters:
+        path (str): file to read; defaults to CONFIG_FILE.
+
+    Returns:
+        dict: the parsed configuration, or {}.
+    """
+    path = CONFIG_FILE if path is None else path
+
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, 'r') as config_file:
+            config = yaml.safe_load(config_file)
+    except (OSError, yaml.YAMLError) as e:
+        logger.error(f"Cannot read the configuration file '{path}': {e}")
+        return {}
+
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        logger.error(f"Configuration file '{path}' does not contain a mapping: ignored.")
+        return {}
+
+    return config
+
+
+# --- Network: which gw-float serves an instance -----------------------------
+#
+# Section 3.4 of figo-network-model.md: a floating IP is served by the gw-float
+# of the instance's own subnet. Resolution is a named function with one answer
+# even while there is a single gateway deployed, because the mistake to avoid is
+# '10.202.9.254' appearing in a dozen places.
+
+FLOAT_GATEWAY_SERVED = 'served'
+FLOAT_GATEWAY_DEPLOYABLE = 'deployable'
+FLOAT_GATEWAY_NO_PUBLIC_VLAN = 'no_public_vlan'
+FLOAT_GATEWAY_UNKNOWN_VLAN = 'unknown_vlan'
+FLOAT_GATEWAY_UNKNOWN_SUBNET = 'unknown_subnet'
+
+FloatGatewayResolution = collections.namedtuple(
+    'FloatGatewayResolution', 'outcome subnet host gateway detail'
+)
+
+
+def subnet_of_remote(remote_info):
+    """Derive the instance subnet of a remote from its gateway and prefix length.
+
+    Pure function. The subnet is not declared anywhere: it is implied by the
+    entries figo already has in REMOTE_TO_IP_INFO_MAP, and deriving it keeps the
+    deployment inventory in one place instead of two that can disagree. Note
+    that several remotes can share one subnet -- 'jeeg' and the controller are
+    virtual machines of goldrake and sit on its subnet -- which is exactly why
+    the gateway is resolved per subnet and not per remote.
+
+    Returns:
+        str: the subnet in CIDR form, or None when the remote does not describe one.
+    """
+    gateway_address = (remote_info or {}).get('gw')
+    prefix_len = (remote_info or {}).get('prefix_len')
+    if not gateway_address or not prefix_len:
+        return None
+
+    try:
+        return str(ipaddress.ip_network(f"{gateway_address}/{prefix_len}", strict=False))
+    except ValueError:
+        return None
+
+
+def parse_network_config(config):
+    """Read the 'network' section of the configuration into normalised form.
+
+    Pure function. Only two things live here, and both are facts that exist
+    nowhere else today: which subnet has a floating-IP gateway, and whether the
+    host of a subnet has an interface on a public VLAN -- the prerequisite for
+    deploying one (Section 3.4). Subnets themselves are *not* redeclared: they
+    are derived from the remotes.
+
+    Malformed entries are reported and dropped rather than guessed at.
+
+    Returns:
+        tuple: (network, warnings) where network is
+               {'gateways': {subnet: {'scope', 'address'}},
+                'subnets': {subnet: {'host', 'public_vlan'}}}.
+    """
+    warnings = []
+    gateways = {}
+    subnets = {}
+
+    section = (config or {}).get('network') or {}
+    if not isinstance(section, dict):
+        return {'gateways': {}, 'subnets': {}}, [
+            "The 'network' section of the configuration is not a mapping: ignored."
+        ]
+
+    def normalised(subnet, where):
+        try:
+            return str(ipaddress.ip_network(subnet, strict=False))
+        except ValueError:
+            warnings.append(f"'{subnet}' in network.{where} is not a subnet: ignored.")
+            return None
+
+    for subnet, entry in (section.get('subnets') or {}).items():
+        key = normalised(subnet, 'subnets')
+        if key is None:
+            continue
+        entry = entry or {}
+        public_vlan = entry.get('public_vlan')
+        if public_vlan is not None and not isinstance(public_vlan, bool):
+            warnings.append(
+                f"network.subnets['{subnet}'].public_vlan is not true or false: "
+                f"treated as unknown."
+            )
+            public_vlan = None
+        subnets[key] = {'host': entry.get('host'), 'public_vlan': public_vlan}
+
+    for subnet, entry in (section.get('float_gateways') or {}).items():
+        key = normalised(subnet, 'float_gateways')
+        if key is None:
+            continue
+        entry = entry or {}
+        if not entry.get('scope'):
+            warnings.append(
+                f"network.float_gateways['{subnet}'] has no 'scope' "
+                f"(remote:project.instance of the gateway): ignored."
+            )
+            continue
+        gateways[key] = {'scope': entry['scope'], 'address': entry.get('address')}
+        subnets.setdefault(key, {'host': None, 'public_vlan': None})
+
+    return {'gateways': gateways, 'subnets': subnets}, warnings
+
+
+def network_subnets(remote_map, network):
+    """Merge the subnets derived from the remotes with what configuration adds.
+
+    Pure function. The remotes say which subnets exist; the configuration says
+    who hosts them and whether that host has a public VLAN. A subnet known from
+    a remote but absent from configuration is kept, with its facts unknown --
+    dropping it would make an instance look as if it lived nowhere.
+
+    Returns:
+        dict: {subnet: {'host', 'public_vlan', 'remotes': [names]}}.
+    """
+    subnets = {}
+
+    for remote, remote_info in (remote_map or {}).items():
+        subnet = subnet_of_remote(remote_info)
+        if subnet is None:
+            continue
+        entry = subnets.setdefault(subnet, {'host': None, 'public_vlan': None, 'remotes': []})
+        entry['remotes'].append(remote)
+
+    for subnet, entry in (network or {}).get('subnets', {}).items():
+        merged = subnets.setdefault(subnet, {'host': None, 'public_vlan': None, 'remotes': []})
+        merged['host'] = entry.get('host')
+        merged['public_vlan'] = entry.get('public_vlan')
+
+    for entry in subnets.values():
+        entry['remotes'].sort()
+
+    return subnets
+
+
+def resolve_float_gateway(instance_address, subnets, gateways):
+    """Decide which gw-float serves an address, or why none does.
+
+    Pure function, and total: every address gets an answer, and the four answers
+    that are not 'served' differ because the remedy differs (Section 3.4). A
+    refusal that says 'not supported' teaches nothing; one that says whether the
+    gateway can be deployed, or whether the obstacle is at switch level, tells
+    the administrator what to do next.
+
+    Parameters:
+        instance_address (str): the private address of the instance.
+        subnets (dict): from network_subnets.
+        gateways (dict): {subnet: {'scope', 'address'}}.
+
+    Returns:
+        FloatGatewayResolution: (outcome, subnet, host, gateway, detail).
+    """
+    try:
+        address = ipaddress.ip_address(str(instance_address).split('/')[0])
+    except ValueError:
+        return FloatGatewayResolution(
+            FLOAT_GATEWAY_UNKNOWN_SUBNET, None, None, None,
+            f"'{instance_address}' is not an IP address."
+        )
+
+    match = None
+    for subnet in subnets:
+        try:
+            network = ipaddress.ip_network(subnet)
+        except ValueError:
+            continue
+        if address in network:
+            # Longest prefix wins: /25 instance ranges overlap /24 host networks.
+            if match is None or network.prefixlen > ipaddress.ip_network(match).prefixlen:
+                match = subnet
+
+    if match is None:
+        return FloatGatewayResolution(
+            FLOAT_GATEWAY_UNKNOWN_SUBNET, None, None, None,
+            f"Address {address} is in no subnet figo knows: add it to the 'network' "
+            f"section of {CONFIG_FILE}, or check the address."
+        )
+
+    entry = subnets[match]
+    host = entry.get('host')
+    named_host = f"'{host}'" if host else "its host"
+
+    if match in gateways:
+        gateway = gateways[match]
+        where = f" at {gateway['address']}" if gateway.get('address') else ""
+        return FloatGatewayResolution(
+            FLOAT_GATEWAY_SERVED, match, host, gateway,
+            f"Subnet {match} is served by the floating-IP gateway "
+            f"'{gateway['scope']}'{where}."
+        )
+
+    if entry.get('public_vlan') is True:
+        return FloatGatewayResolution(
+            FLOAT_GATEWAY_DEPLOYABLE, match, host, None,
+            f"Subnet {match} has no floating-IP gateway yet, but {named_host} has a "
+            f"public VLAN: deploy one with 'figo net gateway deploy'."
+        )
+
+    if entry.get('public_vlan') is False:
+        return FloatGatewayResolution(
+            FLOAT_GATEWAY_NO_PUBLIC_VLAN, match, host, None,
+            f"Subnet {match} cannot have a floating-IP gateway: {named_host} has no "
+            f"interface on a public VLAN, which a gateway needs for its macvlan. "
+            f"That is a switch-level change, outside figo."
+        )
+
+    return FloatGatewayResolution(
+        FLOAT_GATEWAY_UNKNOWN_VLAN, match, host, None,
+        f"Subnet {match} has no floating-IP gateway, and it is not recorded whether "
+        f"{named_host} has a public VLAN. Check, then set 'public_vlan' for that "
+        f"subnet in {CONFIG_FILE}."
+    )
+
+
+# --- Talking to a gw-float gateway ------------------------------------------
+#
+# Read-only. The state of the floating IPs is the config.yaml *inside* the
+# gateway container, read through 'floating-ip list --json' (Section 3.2): never
+# the example file in the repository, never a parallel registry in figo.
+
+GATEWAY_PROBE_OK = 'ok'
+GATEWAY_PROBE_NOT_FOUND = 'not_found'
+GATEWAY_PROBE_UNREACHABLE = 'unreachable'
+GATEWAY_PROBE_ERROR = 'error'
+
+GatewayProbe = collections.namedtuple('GatewayProbe', 'outcome mappings detail')
+
+
+def incus_exec_argv(scope, command):
+    """Build the incus command line that runs 'command' inside a scoped instance.
+
+    Pure function, and it exists because the two notations look alike and are
+    not: figo writes an instance as 'remote:project.instance', while incus wants
+    'remote:instance' with the project as an option. Writing the figo form
+    straight into an incus command yields 'Instance not found', which reads like
+    a missing container rather than a wrong command line.
+
+    Parameters:
+        scope (str): 'remote:project.instance', or 'remote:instance' for the
+                     default project, or a bare instance name for 'local'.
+        command (list): the command to run inside the instance.
+
+    Returns:
+        list: the argv of the incus invocation.
+    """
+    remote, _, rest = scope.rpartition(':')
+    project, _, instance = rest.partition('.')
+    if not instance:
+        project, instance = 'default', project
+
+    target = f"{remote}:{instance}" if remote else instance
+    return ['incus', 'exec', target, '--project', project, '--'] + list(command)
+
+
+def parse_floating_ip_list(stdout):
+    """Read the JSON of 'floating-ip list --json' into a list of mappings.
+
+    Pure function. Shape measured on blade3 on 2026-08-27:
+
+        {"mappings": [{"public", "private", "enabled", "mode",
+                       "allow": {"tcp": [{"pub_port", "priv_port"}], "icmp": [...]},
+                       "active"}]}
+
+    'enabled' is what the YAML asks for and 'active' what is actually on the
+    interface: the gateway keeps them apart on purpose, for an external consumer,
+    and figo is that consumer -- so they are carried separately and never merged
+    into one 'is it working' flag.
+
+    Returns:
+        tuple: (mappings, warnings).
+    """
+    try:
+        payload = json.loads(stdout or '')
+    except ValueError as e:
+        return [], [f"The gateway did not return valid JSON: {e}"]
+
+    if not isinstance(payload, dict) or 'mappings' not in payload:
+        return [], ["The gateway output has no 'mappings' key: unexpected format."]
+
+    mappings = []
+    warnings = []
+    for entry in payload.get('mappings') or []:
+        if not isinstance(entry, dict) or not entry.get('public'):
+            warnings.append(f"Skipping a mapping with no public address: {entry!r}.")
+            continue
+        allow = entry.get('allow') or {}
+        mappings.append({
+            'public': entry.get('public'),
+            'private': entry.get('private'),
+            'enabled': bool(entry.get('enabled')),
+            'active': bool(entry.get('active')),
+            'mode': entry.get('mode'),
+            'tcp': [
+                (port.get('pub_port'), port.get('priv_port'))
+                for port in (allow.get('tcp') or [])
+            ],
+            'udp': [
+                (port.get('pub_port'), port.get('priv_port'))
+                for port in (allow.get('udp') or [])
+            ],
+            'icmp': list(allow.get('icmp') or []),
+        })
+
+    return mappings, warnings
+
+
+def classify_gateway_probe(scope, returncode, stdout, stderr):
+    """Turn the result of the gateway query into a distinct outcome.
+
+    Pure function, same reasoning as the GPU discovery taxonomy: 'the gateway
+    container is not there', 'the remote does not answer' and 'the command
+    failed' are three different situations, and collapsing them hides which one
+    the administrator has to fix.
+    """
+    error_text = (stderr or '').strip()
+
+    if returncode == 0:
+        mappings, warnings = parse_floating_ip_list(stdout)
+        if warnings and not mappings:
+            return GatewayProbe(GATEWAY_PROBE_ERROR, [], "; ".join(warnings))
+        detail = f"{len(mappings)} mapping(s) on '{scope}'."
+        if warnings:
+            detail += " " + " ".join(warnings)
+        return GatewayProbe(GATEWAY_PROBE_OK, mappings, detail)
+
+    lowered = error_text.lower()
+    # 'instance not found' and not merely 'not found': the command missing
+    # *inside* the container reports 'command not found', which is a different
+    # fault with a different fix.
+    if 'instance not found' in lowered:
+        return GatewayProbe(GATEWAY_PROBE_NOT_FOUND, [], (
+            f"No gateway instance '{scope}': check the 'scope' recorded for this "
+            f"subnet in {CONFIG_FILE}. ({error_text})"
+        ))
+    if 'connect' in lowered or 'no route to host' in lowered or 'refused' in lowered:
+        return GatewayProbe(GATEWAY_PROBE_UNREACHABLE, [], (
+            f"Cannot reach the remote hosting '{scope}': {error_text}"
+        ))
+
+    return GatewayProbe(GATEWAY_PROBE_ERROR, [], (
+        f"Querying the gateway '{scope}' failed (exit {returncode})"
+        + (f": {error_text}" if error_text else ".")
+    ))
+
+
+def probe_gateway(scope):
+    """Ask a gw-float instance for its floating-IP mappings. Read-only.
+
+    Runs 'floating-ip list' and nothing else: no 'apply', no write. The gateway
+    on blade3 is production, and figo has no business changing it while merely
+    reporting on it.
+
+    Returns:
+        GatewayProbe: (outcome, mappings, message).
+    """
+    argv = incus_exec_argv(scope, ['floating-ip', 'list', '--json'])
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True)
+    except Exception as e:
+        return GatewayProbe(GATEWAY_PROBE_ERROR, [], (
+            f"Could not run the gateway query for '{scope}': {e}"
+        ))
+
+    return classify_gateway_probe(scope, result.returncode, result.stdout, result.stderr)
 
 
 def get_pci_addresses (remote):
@@ -6948,6 +7360,184 @@ def handle_instance_command(args, parser_dict):
 ###### figo gpu command CLI #################
 #############################################
 
+#############################################
+###### figo net command functions       #####
+#############################################
+
+def figo_network(config=None):
+    """Return the network view figo works with: subnets, gateways, warnings.
+
+    Assembled from the remotes figo already knows and the deployment
+    configuration, which adds only what cannot be derived.
+    """
+    config = load_figo_config() if config is None else config
+    network, warnings = parse_network_config(config)
+    subnets = network_subnets(REMOTE_TO_IP_INFO_MAP, network)
+    return subnets, network['gateways'], warnings
+
+
+def show_gateway_list(extend=False):
+    """List the subnets figo knows and the floating-IP gateway serving each.
+
+    Reads configuration only: no remote is contacted. The STATUS column is the
+    outcome of the resolution of Section 3.4, so a subnet without a gateway says
+    whether one can be deployed or not.
+    """
+    subnets, gateways, warnings = figo_network()
+
+    COLS = [('SUBNET', 19), ('HOST', 11), ('PUBLIC VLAN', 12), ('REMOTES', 18),
+            ('GATEWAY', 26), ('ADDRESS', 15), ('STATUS', 14)]
+    add_header_line_to_output(COLS)
+
+    for subnet in sorted(subnets, key=lambda name: ipaddress.ip_network(name)):
+        entry = subnets[subnet]
+        # Resolve from an address inside the subnet: the resolution is the same
+        # for every address it contains, and this keeps one code path.
+        probe_address = str(next(ipaddress.ip_network(subnet).hosts()))
+        resolution = resolve_float_gateway(probe_address, subnets, gateways)
+        gateway = gateways.get(subnet) or {}
+        public_vlan = entry.get('public_vlan')
+        add_row_to_output(COLS, [
+            subnet,
+            entry.get('host') or "-",
+            {True: "yes", False: "no", None: "unknown"}[public_vlan],
+            ", ".join(entry.get('remotes') or []) or "-",
+            gateway.get('scope') or "-",
+            gateway.get('address') or "-",
+            resolution.outcome,
+        ])
+
+    flush_output(extend=extend)
+
+    if not subnets:
+        logger.info("No subnet is known: figo derives them from the remotes.")
+    for warning in warnings:
+        logger.warning(warning)
+
+
+def show_gateway_status(remote=None, extend=False):
+    """Query each configured gw-float and report what it holds. Read-only.
+
+    Args:
+    - remote: restrict to the gateways hosted on this remote.
+    - extend: adapt the column width to the content.
+    """
+    subnets, gateways, warnings = figo_network()
+
+    selected = {
+        subnet: gateway for subnet, gateway in gateways.items()
+        if remote is None or gateway['scope'].split(':')[0] == remote
+    }
+
+    if not selected:
+        where = f" on remote '{remote}'" if remote else ""
+        logger.info(
+            f"No floating-IP gateway is configured{where}: declare it under "
+            f"network.float_gateways in {CONFIG_FILE}, or deploy one."
+        )
+        return
+
+    COLS = [('SUBNET', 19), ('GATEWAY', 26), ('STATE', 14), ('MAPPINGS', 9),
+            ('ENABLED', 8), ('ACTIVE', 7), ('DRIFT', 6)]
+    add_header_line_to_output(COLS)
+
+    probes = {}
+    for subnet in sorted(selected, key=lambda name: ipaddress.ip_network(name)):
+        gateway = selected[subnet]
+        probe = probe_gateway(gateway['scope'])
+        probes[subnet] = probe
+
+        enabled = [m for m in probe.mappings if m['enabled']]
+        active = [m for m in probe.mappings if m['active']]
+        drift = [m for m in probe.mappings if m['enabled'] != m['active']]
+
+        add_row_to_output(COLS, [
+            subnet,
+            gateway['scope'],
+            probe.outcome,
+            str(len(probe.mappings)) if probe.outcome == GATEWAY_PROBE_OK else "-",
+            str(len(enabled)) if probe.outcome == GATEWAY_PROBE_OK else "-",
+            str(len(active)) if probe.outcome == GATEWAY_PROBE_OK else "-",
+            str(len(drift)) if probe.outcome == GATEWAY_PROBE_OK else "-",
+        ])
+
+    flush_output(extend=extend)
+
+    for subnet, probe in probes.items():
+        if probe.outcome != GATEWAY_PROBE_OK:
+            logger.error(probe.detail)
+            continue
+        for mapping in probe.mappings:
+            if mapping['enabled'] != mapping['active']:
+                logger.warning(
+                    f"Drift on '{selected[subnet]['scope']}': {mapping['public']} -> "
+                    f"{mapping['private']} is enabled={mapping['enabled']} but "
+                    f"active={mapping['active']} -- what the configuration asks for "
+                    f"is not what is on the interface."
+                )
+
+    for warning in warnings:
+        logger.warning(warning)
+
+
+def create_net_parser(subparsers):
+    net_parser = subparsers.add_parser(
+        "net",
+        help="Inspect the network: floating-IP gateways and public IP mappings.",
+        description="Report on the floating-IP gateways serving the instance subnets,\n"
+                    "and on the public IP mappings they hold. Read-only in this release.",
+        epilog="Use 'figo net <command> -h' for detailed help on a specific command.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    net_subparsers = net_parser.add_subparsers(dest="net_command")
+
+    gateway_parser = net_subparsers.add_parser(
+        "gateway",
+        help="Floating-IP gateways: which subnet each one serves, and its state.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command")
+
+    gateway_list_parser = gateway_subparsers.add_parser(
+        "list",
+        aliases=["l"],
+        help="List the known subnets and the gateway serving each one.",
+        description="List every subnet figo knows, derived from the remotes, with the\n"
+                    "floating-IP gateway serving it and whether one could be deployed.\n"
+                    "Reads configuration only: no remote is contacted.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net gateway list\n"
+               "  figo net gateway list --extend"
+    )
+    gateway_list_parser.add_argument(
+        "-e", "--extend", action="store_true", help="Extend column width to fit the content"
+    )
+
+    gateway_status_parser = gateway_subparsers.add_parser(
+        "status",
+        help="Query the configured gateways and report the mappings they hold.",
+        description="Ask each configured gw-float for its floating-IP mappings and report\n"
+                    "how many are enabled, how many are active, and where the two differ.\n"
+                    "Read-only: it runs 'floating-ip list', never 'apply'.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net gateway status\n"
+               "  figo net gateway status blade3"
+    )
+    gateway_status_parser.add_argument(
+        "remote",
+        nargs="?",
+        default=None,
+        help="Restrict to the gateways hosted on this remote."
+    )
+    gateway_status_parser.add_argument(
+        "-e", "--extend", action="store_true", help="Extend column width to fit the content"
+    )
+
+    return net_parser
+
+
 def create_gpu_parser(subparsers):
     gpu_parser = subparsers.add_parser(
         "gpu",
@@ -7106,6 +7696,25 @@ def create_gpu_parser(subparsers):
 
     return gpu_parser
 
+
+
+def handle_net_command(args, parser_dict):
+    """Handle subcommands of 'figo net'. Read-only in this release."""
+
+    def fix_remote_name(remote_name):
+        return remote_name.rstrip(':') if remote_name else remote_name
+
+    if not args.net_command:
+        parser_dict['net_parser'].print_help()
+        return
+
+    if args.net_command == "gateway":
+        if not args.gateway_command:
+            parser_dict['net_parser'].print_help()
+        elif args.gateway_command in ["list", "l"]:
+            show_gateway_list(extend=args.extend)
+        elif args.gateway_command == "status":
+            show_gateway_status(remote=fix_remote_name(args.remote), extend=args.extend)
 
 
 def handle_gpu_command(args, parser_dict):
@@ -8247,6 +8856,7 @@ def create_parser():
     parser_dict = {}
     parser_dict['instance_parser'] = create_instance_parser(subparsers)
     parser_dict['gpu_parser'] = create_gpu_parser(subparsers)
+    parser_dict['net_parser'] = create_net_parser(subparsers)
     parser_dict['profile_parser'] = create_profile_parser(subparsers)
     parser_dict['user_parser'] = create_user_parser(subparsers)
     parser_dict['remote_parser'] = create_remote_parser(subparsers)
@@ -8279,6 +8889,8 @@ def handle_command(args, parser, parser_dict):
         handle_project_command(args, parser_dict)
     elif args.command in ["operation", "op", "o"]:
         handle_operation_command(args, parser_dict)
+    elif args.command in ["net"]:
+        handle_net_command(args, parser_dict)
     elif args.command in ["vpn"]:
         handle_vpn_command(args, parser_dict)
     elif args.command in ["storage"]:

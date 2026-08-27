@@ -1,0 +1,51 @@
+# figo — deployment configuration (example)
+#
+# Copy this file to 'config.yaml' beside 'profiles/' and 'users/' and edit it.
+# 'config.yaml' is deliberately NOT versioned: it describes *this* installation,
+# not figo. The file is optional — with no file figo behaves exactly as it did
+# before it existed, falling back to the values in the source.
+#
+# See figo-network-model.md Section 5.2 and figo-hardcoded-constants.md: the
+# long-term goal is that the deployment facts still hard-coded in figo.py move
+# here. The 'network' section below is the first one to live here from the start
+# rather than being migrated later.
+
+network:
+
+  # Which subnet has a floating-IP gateway (gw-float), and where it is.
+  #
+  # 'scope' is the gateway instance as figo names instances,
+  # remote:project.instance. 'address' is its address inside the subnet — the
+  # one that instances served by it must have as their default gateway.
+  #
+  # Subnets themselves are NOT declared here: they are derived from the gateway
+  # and prefix length already recorded per remote, so the inventory stays in one
+  # place. Note that several remotes can share a subnet — jeeg and the
+  # controller are virtual machines of goldrake and sit on its subnet — which is
+  # why a gateway is resolved per subnet and never per remote.
+  float_gateways:
+    "10.202.9.128/25":
+      scope: "blade3:default.gw-float"
+      address: "10.202.9.254"
+
+  # What figo cannot derive: who hosts a subnet, and whether that host has an
+  # interface on a public VLAN. The second is the hard prerequisite for
+  # deploying a gateway, because gw-float attaches to that VLAN with macvlan;
+  # a host without it needs a switch-level change, which is outside figo.
+  #
+  # Leave 'public_vlan' out rather than guessing: an unknown value produces a
+  # message that says to check, while a wrong one produces a confident answer
+  # that is wrong.
+  subnets:
+    "10.202.9.128/25":
+      host: blade3
+      public_vlan: true
+    "10.202.8.128/25":
+      host: goldrake
+      public_vlan: true
+    "10.202.10.128/25":
+      host: eln_cloud
+      public_vlan: false
+    "10.202.128.128/25":
+      host: figo-2gpu
+      public_vlan: false
