@@ -398,3 +398,14 @@ def test_removing_is_never_gated_on_the_invariant(figo):
         figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
     )
     assert refusals == []
+
+
+def test_two_messages_do_not_arrive_glued_together(figo):
+    """Measured on the real gateway: the invariant detail does not always end in
+    a full stop, and the warning is built by appending to it."""
+    _refusals, warnings = figo.float_write_decision(
+        "add", "160.80.105.44", None,
+        figo.FLOAT_INVARIANT_UNKNOWN,
+        "Cannot tell whether 'float-test' satisfies the invariant: the route was not read"
+    )
+    assert "not read. figo cannot verify it" in warnings[0]

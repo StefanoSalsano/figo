@@ -7816,16 +7816,25 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
     """
     refusals, warnings = [], []
 
+    def as_sentence(text):
+        """One message is built from two, and the first does not always end in a
+        full stop: without this they arrive glued together mid-sentence."""
+        text = (text or "").strip()
+        if text and text[-1] not in ".!?":
+            text += "."
+        return text
+
     def judge_invariant():
+        detail = as_sentence(invariant_detail)
         if invariant == FLOAT_INVARIANT_VIOLATED:
             refusals.append(
-                f"{invariant_detail} Serving more traffic through {public_ip} would "
+                f"{detail} Serving more traffic through {public_ip} would "
                 f"produce a mapping that looks right and does not work. Fix the "
                 f"default route of the instance first, or leave the mapping off."
             )
         elif invariant in (FLOAT_INVARIANT_UNKNOWN, FLOAT_INVARIANT_NOT_CHECKED):
             warnings.append(
-                (invariant_detail or "The default-gateway invariant could not be checked.")
+                (detail or "The default-gateway invariant could not be checked.")
                 + f" figo cannot verify it, so it does not refuse: {public_ip} will be "
                 f"turned on and may not work. Check with 'figo net float show {public_ip}'."
             )
