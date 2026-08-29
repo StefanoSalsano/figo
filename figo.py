@@ -8000,7 +8000,9 @@ def create_net_parser(subparsers):
         "status",
         help="Query the configured gateways and report the mappings they hold.",
         description="Ask each configured gw-float for its floating-IP mappings and report\n"
-                    "how many are enabled, how many are active, and where the two differ.\n"
+                    "how many are enabled, how many are active, where the two differ, and\n"
+                    "how many have rules that do not match the configuration. A gateway too\n"
+                    "old to report that last one shows '-' rather than 0.\n"
                     "Read-only: it runs 'floating-ip list', never 'apply'.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
