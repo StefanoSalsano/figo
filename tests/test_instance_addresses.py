@@ -103,3 +103,42 @@ def test_a_global_ipv6_address_is_not_one_of_these_addresses(figo):
             {"family": "inet6", "address": "2001:db8::1", "scope": "global"}]},
     }}}
     assert figo.live_ip_device_pairs(entry) == [("10.202.9.211", "eth0")]
+
+
+# --- Which measured address answers the question ----------------------------
+
+def test_the_address_that_was_configured_comes_first(figo):
+    """Measured on blade3, 2026-08-29: an instance running Docker holds its own
+    bridge, incus lists it first, and the column cut off the address that
+    matters -- so the instance that was perfectly configured looked broken."""
+    configured = [("10.202.9.210/25", "eth0")]
+    live = [("172.18.0.1", "br-5ece4"), ("10.202.9.210", "eth0")]
+    shown, others = figo.order_live_pairs(configured, live)
+    assert shown == [("10.202.9.210", "eth0")]
+    assert others == 1
+
+
+def test_the_same_address_on_another_device_still_counts(figo):
+    """ioam-factory holds the configured address on br0, not on enp5s0: the
+    address is what was asked for, and the bridge is how the instance chose to
+    carry it."""
+    shown, others = figo.order_live_pairs(
+        [("10.202.9.213/25", "enp5s0")], [("10.202.9.213", "br0")])
+    assert shown == [("10.202.9.213", "br0")]
+    assert others == 0
+
+
+def test_when_nothing_matches_everything_is_shown(figo):
+    """The divergence case: hiding the addresses the instance does hold would
+    leave the reader with no idea what it is on instead."""
+    shown, others = figo.order_live_pairs(
+        [("10.202.9.217/25", "eth0")], [("10.202.9.144", "eth0")])
+    assert shown == [("10.202.9.144", "eth0")]
+    assert others == 0
+
+
+def test_an_instance_figo_never_configured_shows_what_it_has(figo):
+    """gw-float has no user.network-config at all: everything it holds is news."""
+    shown, others = figo.order_live_pairs([], [("10.202.9.254", "internal")])
+    assert shown == [("10.202.9.254", "internal")]
+    assert others == 0

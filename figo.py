@@ -919,6 +919,33 @@ def live_ip_device_pairs(instance):
     return pairs
 
 
+def order_live_pairs(configured_pairs, live_pairs):
+    """Put the measured addresses that answer the question first. Pure function.
+
+    An instance holds more addresses than the one figo configured: a container
+    running Docker holds its own bridge, and those come back from the state in
+    whatever order incus lists the interfaces. Measured on blade3 on
+    2026-08-29: two instances showed 172.18.0.1 on a 'br-*' interface while the
+    address that matters was there too, further down, and the column cut it
+    off -- the two instances that were perfectly configured looked like the
+    broken ones.
+
+    Nothing is hidden: what does not fit the first group is counted, and -e
+    shows the lot.
+
+    Returns:
+        tuple: (pairs to show, how many were left out).
+    """
+    configured = {address.split('/')[0] for address, _device in configured_pairs or []}
+    if not configured:
+        return list(live_pairs or []), 0
+
+    matching = [pair for pair in live_pairs or [] if pair[0] in configured]
+    if not matching:
+        return list(live_pairs or []), 0
+    return matching, len(live_pairs) - len(matching)
+
+
 def address_divergence(configured_pairs, live_pairs):
     """The configured addresses an instance is not actually holding.
 
@@ -1066,7 +1093,10 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
         additional_entries = get_additional_ips_from_config(instance.get("config"))
 
         live_pairs = live_ip_device_pairs(instance)
-        live_str = format_ip_device_pairs(live_pairs) if live_pairs else "-"
+        shown_live, other_live = order_live_pairs(ip_device_pairs, live_pairs)
+        live_str = format_ip_device_pairs(shown_live) if shown_live else "-"
+        if other_live:
+            live_str += f" +{other_live}"
         missing = address_divergence(ip_device_pairs, live_pairs)
         if missing:
             live_str += "  <--"
