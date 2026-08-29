@@ -7577,6 +7577,210 @@ def index_instances_by_address(instance_records):
     return index, warnings
 
 
+def select_gateway_for_remote(gateways, remote):
+    """Pick the gateway that serves a remote, and say so when the choice is not unique.
+
+    Pure function, shared by the read and the write paths: a write must act on
+    exactly the gateway the reports describe, and two copies of this choice
+    would be two chances for them to disagree.
+
+    Returns:
+        tuple: (subnet, gateway, warnings). gateway is None when the remote has
+               no gateway configured, and the warning says where to declare one.
+    """
+    serving = {
+        subnet: gateway for subnet, gateway in (gateways or {}).items()
+        if gateway['scope'].split(':')[0] == remote
+    }
+    if not serving:
+        return None, None, [
+            f"No floating-IP gateway is configured on remote '{remote}': declare it "
+            f"under network.float_gateways in {CONFIG_FILE}."
+        ]
+
+    subnet = sorted(serving)[0]
+    gateway = serving[subnet]
+    warnings = []
+    if len(serving) > 1:
+        warnings.append(
+            f"Remote '{remote}' has more than one gateway configured; using "
+            f"'{gateway['scope']}' for subnet {subnet}."
+        )
+    return subnet, gateway, warnings
+
+
+def floating_ip_write_argv(scope, verb, public_ip, note=None):
+    """Build the argv that runs one write verb of the gateway tool in its container.
+
+    Pure function. '--note' goes with 'disable' only: the gateway accepts it
+    nowhere else, and a mapping turned off with nobody recording why is the
+    case that field exists for.
+    """
+    command = ['floating-ip', verb, public_ip]
+    if note is not None:
+        if verb != 'disable':
+            raise ValueError(f"'{verb}' does not take a note")
+        command += ['--note', note]
+    return incus_exec_argv(scope, command)
+
+
+def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=None):
+    """Decide whether figo may run a write verb on a mapping, and say why not.
+
+    Pure function. 'row' is the joined row for that public address, or None when
+    the gateway holds no mapping for it.
+
+    Deliberately asymmetric, and this is the point of it: a write that *starts*
+    serving traffic is refused when a precondition figo can check itself does
+    not hold, while a write that *stops* it never is. Refusing to disable a
+    broken mapping would withhold the remedy from the person applying it --
+    'disable' is one of the remedies.
+
+    Section 7.3 of the network model: refuse what figo can verify, warn about
+    what it cannot. So a violated invariant is a refusal, and an invariant that
+    could not be read at all is a warning that lets the write through.
+
+    Returns:
+        tuple: (refusals, warnings). No refusals means the write may proceed.
+    """
+    refusals, warnings = [], []
+
+    if row is None:
+        refusals.append(
+            f"No mapping for {public_ip} on this gateway. 'figo net float list' "
+            f"shows the addresses it holds, and 'figo net float add' is the verb "
+            f"that creates one."
+        )
+        return refusals, warnings
+
+    if verb != 'enable':
+        return refusals, warnings
+
+    if invariant == FLOAT_INVARIANT_VIOLATED:
+        refusals.append(
+            f"{invariant_detail} Turning {public_ip} on would produce a mapping "
+            f"that looks right and does not work. Fix the default route of the "
+            f"instance first, or leave the mapping off."
+        )
+    elif invariant in (FLOAT_INVARIANT_UNKNOWN, FLOAT_INVARIANT_NOT_CHECKED):
+        warnings.append(
+            (invariant_detail or "The default-gateway invariant could not be checked.")
+            + f" figo cannot verify it, so it does not refuse: {public_ip} will be "
+            f"turned on and may not work. Check with 'figo net float show {public_ip}'."
+        )
+
+    return refusals, warnings
+
+
+def set_float_enabled(remote, public_ip, enable, note=None, dry_run=False):
+    """Turn a mapping on or off through the gateway, then apply and re-read.
+
+    The only write path in figo that touches a gateway, and it reports what it
+    measured afterwards rather than what it asked for: the gateway is the
+    authority on its own state.
+    """
+    verb = 'enable' if enable else 'disable'
+    state = 'enabled' if enable else 'disabled'
+
+    _subnets, gateways, warnings = figo_network()
+    _subnet, gateway, selection_warnings = select_gateway_for_remote(gateways, remote)
+    for warning in warnings + selection_warnings:
+        logger.warning(warning)
+    if gateway is None:
+        return
+
+    probe = probe_gateway(gateway['scope'])
+    if probe.outcome != GATEWAY_PROBE_OK:
+        logger.error(probe.detail)
+        return
+
+    records = collect_instance_records(remote)
+    address_index, index_warnings = index_instances_by_address(records)
+    for warning in index_warnings:
+        logger.warning(warning)
+    rows = build_float_rows(probe.mappings, address_index)
+    row = next((r for r in rows if r.get('public') == public_ip), None)
+
+    # The invariant has to be read on purpose here. A mapping about to be
+    # enabled is off, and the read path skips the route of a mapping that is
+    # neither enabled nor active -- exactly the state this command starts from.
+    invariant, invariant_detail = None, None
+    if row is not None and enable:
+        instance = row.get('instance')
+        gateway_read = None
+        if instance and instance['status'] == "Running":
+            gateway_read = probe_default_gateway(instance['scope'])
+        invariant, invariant_detail = float_invariant_status(
+            dict(row, enabled=True), instance, gateway_read, gateway.get('address')
+        )
+
+    refusals, write_warnings = float_write_decision(
+        verb, public_ip, row, invariant, invariant_detail
+    )
+    for warning in write_warnings:
+        logger.warning(warning)
+    if refusals:
+        for refusal in refusals:
+            logger.error(refusal)
+        return
+
+    if row.get('enabled') == enable and note is None:
+        logger.info(
+            f"{public_ip} is already {state}: nothing to do, and nothing applied."
+        )
+        return
+
+    argv = floating_ip_write_argv(gateway['scope'], verb, public_ip, note)
+    apply_argv = incus_exec_argv(gateway['scope'], ['floating-ip', 'apply'])
+
+    if dry_run:
+        logger.info("Dry run: nothing was changed. figo would run, in this order:")
+        logger.info("  " + " ".join(argv))
+        logger.info("  " + " ".join(apply_argv))
+        return
+
+    result = subprocess.run(argv, capture_output=True, text=True)
+    if (result.stdout or '').strip():
+        print(result.stdout.rstrip())
+    if result.returncode != 0:
+        logger.error(
+            f"The gateway refused '{verb} {public_ip}': "
+            f"{(result.stderr or result.stdout or '').strip()}. Nothing was applied, "
+            f"so its rules are unchanged."
+        )
+        return
+
+    applied = subprocess.run(apply_argv, capture_output=True, text=True)
+    if applied.returncode != 0:
+        logger.error(
+            f"The configuration was changed but 'floating-ip apply' failed: "
+            f"{(applied.stderr or applied.stdout or '').strip()}. The gateway now asks "
+            f"for something its rules do not do -- run 'floating-ip apply' inside "
+            f"'{gateway['scope']}', and see 'figo net float show {public_ip}'."
+        )
+        return
+
+    after = probe_gateway(gateway['scope'])
+    if after.outcome != GATEWAY_PROBE_OK:
+        logger.warning(
+            f"The change was applied but re-reading the gateway failed: {after.detail}"
+        )
+        return
+
+    new_row = next((m for m in after.mappings if m.get('public') == public_ip), None)
+    if new_row is None:
+        logger.warning(
+            f"The change was applied but {public_ip} is no longer in the gateway's "
+            f"answer, which should not happen: read it with 'figo net float list'."
+        )
+        return
+
+    logger.info(
+        f"{public_ip} is now enabled={new_row['enabled']}, active={new_row['active']}, "
+        f"rules {format_rule_drift(new_row.get('drift'))}."
+    )
+
+
 def build_float_rows(mappings, address_index):
     """Join the gateway's mappings with the instances figo knows.
 
@@ -7778,23 +7982,10 @@ def gather_float_state(remote):
     """
     subnets, gateways, warnings = figo_network()
 
-    serving = {
-        subnet: gateway for subnet, gateway in gateways.items()
-        if gateway['scope'].split(':')[0] == remote
-    }
-    if not serving:
-        return [], None, None, warnings + [
-            f"No floating-IP gateway is configured on remote '{remote}': declare it "
-            f"under network.float_gateways in {CONFIG_FILE}."
-        ]
-
-    subnet = sorted(serving)[0]
-    gateway = serving[subnet]
-    if len(serving) > 1:
-        warnings.append(
-            f"Remote '{remote}' has more than one gateway configured; reporting "
-            f"'{gateway['scope']}' for subnet {subnet}."
-        )
+    _subnet, gateway, selection_warnings = select_gateway_for_remote(gateways, remote)
+    warnings = warnings + selection_warnings
+    if gateway is None:
+        return [], None, None, warnings
 
     probe = probe_gateway(gateway['scope'])
     if probe.outcome != GATEWAY_PROBE_OK:
@@ -8075,6 +8266,55 @@ def create_net_parser(subparsers):
         "-e", "--extend", action="store_true", help="Extend column width to fit the content"
     )
 
+    float_enable_parser = float_subparsers.add_parser(
+        "enable",
+        help="Turn a mapping on, and apply.",
+        description="Ask the gateway to enable a mapping, then reinstall its rules.\n"
+                    "Refuses if the instance holding the private address does not route\n"
+                    "by default through that gateway (3.3): the mapping would look right\n"
+                    "and not work. Warns and proceeds when figo cannot check, because a\n"
+                    "check it could not make is not a reason to block the operator.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float enable 160.80.105.43\n"
+               "  figo net float enable 160.80.105.43 --dry-run"
+    )
+    float_enable_parser.add_argument("public_ip", help="The public address of the mapping")
+    float_enable_parser.add_argument(
+        "-r", "--remote", default="blade3",
+        help="Remote whose gateway holds the mapping. Defaults to 'blade3'."
+    )
+    float_enable_parser.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Print the commands figo would run in the gateway, and change nothing"
+    )
+
+    float_disable_parser = float_subparsers.add_parser(
+        "disable",
+        help="Turn a mapping off, and apply.",
+        description="Ask the gateway to disable a mapping, then reinstall its rules.\n"
+                    "Never refused on the default-gateway invariant: turning a mapping\n"
+                    "off is one of the remedies for a broken one.\n"
+                    "--note records why, in the mapping itself.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float disable 160.80.105.43\n"
+               "  figo net float disable 160.80.105.43 --note \"upstream has not allowed 22\""
+    )
+    float_disable_parser.add_argument("public_ip", help="The public address of the mapping")
+    float_disable_parser.add_argument(
+        "--note", default=None,
+        help="Record why the mapping is being turned off, in the mapping itself"
+    )
+    float_disable_parser.add_argument(
+        "-r", "--remote", default="blade3",
+        help="Remote whose gateway holds the mapping. Defaults to 'blade3'."
+    )
+    float_disable_parser.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Print the commands figo would run in the gateway, and change nothing"
+    )
+
     return net_parser
 
 
@@ -8265,6 +8505,12 @@ def handle_net_command(args, parser_dict):
         elif args.float_command in ["show", "s"]:
             show_float_show(fix_remote_name(args.remote), args.public_ip,
                             as_json=args.as_json, extend=args.extend)
+        elif args.float_command == "enable":
+            set_float_enabled(fix_remote_name(args.remote), args.public_ip, True,
+                              dry_run=args.dry_run)
+        elif args.float_command == "disable":
+            set_float_enabled(fix_remote_name(args.remote), args.public_ip, False,
+                              note=args.note, dry_run=args.dry_run)
 
 
 def handle_gpu_command(args, parser_dict):
