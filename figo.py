@@ -1681,6 +1681,28 @@ def parse_floating_ip_list(stdout):
     return mappings, warnings
 
 
+def summarize_rule_drift(mappings):
+    """Count the mappings whose installed rules differ from the configuration.
+
+    Pure function. The gateway answers a question 'enabled' and 'active' cannot:
+    those two compare what the configuration asks for with what is on the
+    interface, while this one compares the configuration with the iptables rules
+    actually installed. A mapping can be enabled, hold its address, and still
+    have the wrong rules.
+
+    Returns:
+        tuple: (reported, inconsistent). 'reported' is False when no mapping
+               carries the field -- a gateway too old to answer -- and the caller
+               must show that as unknown, never as zero: 'nobody looked' and 'the
+               rules are right' are different answers, and only one of them is
+               good news.
+    """
+    known = [m for m in mappings or [] if m.get('drift') is not None]
+    if not known:
+        return False, 0
+    return True, sum(1 for m in known if not m['drift'].get('consistent'))
+
+
 def classify_gateway_probe(scope, returncode, stdout, stderr):
     """Turn the result of the gateway query into a distinct outcome.
 
@@ -7678,8 +7700,12 @@ def show_gateway_status(remote=None, extend=False):
         )
         return
 
+    # DRIFT and RULES are two different questions: DRIFT is the configuration
+    # against the interface, RULES the configuration against the installed
+    # iptables rules, as the gateway reports them. A gateway that does not
+    # report the second shows '-' rather than 0.
     COLS = [('SUBNET', 19), ('GATEWAY', 26), ('STATE', 14), ('MAPPINGS', 9),
-            ('ENABLED', 8), ('ACTIVE', 7), ('DRIFT', 6)]
+            ('ENABLED', 8), ('ACTIVE', 7), ('DRIFT', 6), ('RULES', 6)]
     add_header_line_to_output(COLS)
 
     probes = {}
@@ -7691,6 +7717,7 @@ def show_gateway_status(remote=None, extend=False):
         enabled = [m for m in probe.mappings if m['enabled']]
         active = [m for m in probe.mappings if m['active']]
         drift = [m for m in probe.mappings if m['enabled'] != m['active']]
+        reported, rule_drift = summarize_rule_drift(probe.mappings)
 
         add_row_to_output(COLS, [
             subnet,
@@ -7700,6 +7727,8 @@ def show_gateway_status(remote=None, extend=False):
             str(len(enabled)) if probe.outcome == GATEWAY_PROBE_OK else "-",
             str(len(active)) if probe.outcome == GATEWAY_PROBE_OK else "-",
             str(len(drift)) if probe.outcome == GATEWAY_PROBE_OK else "-",
+            (str(rule_drift) if reported else "-")
+            if probe.outcome == GATEWAY_PROBE_OK else "-",
         ])
 
     flush_output(extend=extend)
@@ -7716,6 +7745,21 @@ def show_gateway_status(remote=None, extend=False):
                     f"active={mapping['active']} -- what the configuration asks for "
                     f"is not what is on the interface."
                 )
+            drift = mapping.get('drift')
+            if drift and not drift.get('consistent'):
+                logger.warning(
+                    f"Rule drift on '{selected[subnet]['scope']}': {mapping['public']} "
+                    f"-> {mapping['private']} has {drift['missing']} rule(s) missing "
+                    f"and {drift['extra']} extra -- the configuration and the "
+                    f"installed rules disagree. 'floating-ip apply' on the gateway "
+                    f"reinstalls them."
+                )
+        if probe.mappings and not summarize_rule_drift(probe.mappings)[0]:
+            logger.info(
+                f"The gateway '{selected[subnet]['scope']}' does not report rule "
+                f"drift: RULES is shown as '-' because nobody measured it, not "
+                f"because the rules are right. Upgrading the gateway fills it in."
+            )
 
     for warning in warnings:
         logger.warning(warning)
@@ -7775,6 +7819,15 @@ def gather_float_state(remote):
         )
 
     return rows, gateway.get('address'), probe, warnings
+
+
+def format_rule_drift(drift):
+    """Render one mapping's rule drift for a human, keeping unknown distinct."""
+    if drift is None:
+        return "not reported"
+    if drift.get('consistent'):
+        return "consistent"
+    return f"{drift.get('missing', 0)} missing, {drift.get('extra', 0)} extra"
 
 
 def float_row_as_dict(row):
@@ -7890,6 +7943,9 @@ def show_float_show(remote, public_ip, as_json=False, extend=False):
         ('enabled', "yes" if row.get('enabled') else "no"),
         ('active', "yes" if row.get('active') else "no"),
         ('mode', row.get('mode') or "-"),
+        ('label', row.get('label') or "-"),
+        ('note', row.get('note') or "-"),
+        ('rules', format_rule_drift(row.get('drift'))),
         ('tcp', ports),
         ('udp', udp_ports),
         ('icmp', "all" if row.get('icmp_all')

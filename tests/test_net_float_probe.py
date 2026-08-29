@@ -278,6 +278,45 @@ def test_label_and_note_survive_parsing(figo):
     assert mappings[0]["note"] == "port 22 not allowed upstream yet"
 
 
+def test_rule_drift_of_an_old_gateway_is_unknown_not_zero(figo):
+    """The column must show '-', and the only way to get it is this flag."""
+    mappings, _ = figo.parse_floating_ip_list(REAL_OUTPUT)
+    assert figo.summarize_rule_drift(mappings) == (False, 0)
+
+
+def test_rule_drift_of_a_healthy_gateway_is_reported_zero(figo):
+    mappings, _ = figo.parse_floating_ip_list(REAL_OUTPUT_MERGED)
+    assert figo.summarize_rule_drift(mappings) == (True, 0)
+
+
+def test_rule_drift_counts_the_inconsistent_mappings(figo):
+    mappings, _ = figo.parse_floating_ip_list(json.dumps({"mappings": [
+        {"public": "160.80.105.44", "private": "10.202.9.220",
+         "enabled": True, "active": True, "allow": {},
+         "drift": {"missing": 2, "extra": 0, "consistent": False}},
+        {"public": "160.80.105.45", "private": "10.202.9.221",
+         "enabled": True, "active": True, "allow": {},
+         "drift": {"missing": 0, "extra": 0, "consistent": True}},
+        {"public": "160.80.105.46", "private": "10.202.9.222",
+         "enabled": True, "active": True, "allow": {},
+         "drift": {"missing": 0, "extra": 3, "consistent": False}},
+    ]}))
+    assert figo.summarize_rule_drift(mappings) == (True, 2)
+
+
+def test_rule_drift_of_an_empty_gateway(figo):
+    assert figo.summarize_rule_drift([]) == (False, 0)
+    assert figo.summarize_rule_drift(None) == (False, 0)
+
+
+def test_unknown_rule_drift_reads_as_unknown_for_a_human(figo):
+    assert figo.format_rule_drift(None) == "not reported"
+    assert figo.format_rule_drift({"missing": 0, "extra": 0, "consistent": True}) == (
+        "consistent")
+    assert figo.format_rule_drift(
+        {"missing": 2, "extra": 6, "consistent": False}) == "2 missing, 6 extra"
+
+
 # --- The taxonomy of asking ------------------------------------------------
 
 def test_successful_probe(figo):
