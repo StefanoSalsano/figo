@@ -7852,7 +7852,10 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
 
     result = subprocess.run(argv, capture_output=True, text=True)
     if (result.stdout or '').strip():
-        print(result.stdout.rstrip())
+        # stdout is block-buffered when it is a pipe and stderr is not, so
+        # without this flush the summary logged below reaches the reader before
+        # the gateway output it summarises. Measured on the real gateway.
+        print(result.stdout.rstrip(), flush=True)
     if result.returncode != 0:
         logger.error(
             f"The gateway refused '{verb} {public_ip}': "
