@@ -8190,7 +8190,10 @@ def show_float_diagnose(remote, instance_reference, extend=False):
         invariant, invariant_detail, listeners, upstream
     )
 
-    COLS = [('CHECK', 12), ('SUBJECT', 46), ('VERDICT', 22)]
+    # VERDICT is the widest column on purpose: the upstream row carries the
+    # confidence and the date, which are the reason that row exists at all,
+    # and truncating them leaves a warning nobody can weigh.
+    COLS = [('CHECK', 12), ('SUBJECT', 44), ('VERDICT', 42)]
     add_header_line_to_output(COLS)
     for check, subject, verdict, is_problem in rows:
         add_row_to_output(COLS, [check, subject, verdict + ("   <--" if is_problem else "")])
