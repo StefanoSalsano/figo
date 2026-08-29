@@ -283,3 +283,118 @@ def test_clearing_is_compared_against_emptiness_not_against_the_text(figo):
     labelled = dict(row(), label="web-team")
     assert figo.float_write_is_noop(
         "label", labelled, text="web-team", clear=True) is False
+
+
+# --- Creating and deleting a whole mapping ----------------------------------
+
+RECORDS_FOR_ADD = [
+    {"name": "myinst", "project": "figo-x", "scope": "blade3:figo-x.myinst",
+     "status": "Running", "addresses": ["10.202.9.220/25"], "additional": []},
+    {"name": "myinst", "project": "figo-y", "scope": "blade3:figo-y.myinst",
+     "status": "Running", "addresses": ["10.202.9.221/25"], "additional": []},
+    {"name": "alone", "project": "figo-x", "scope": "blade3:figo-x.alone",
+     "status": "Stopped", "addresses": ["10.202.9.222/25", "10.202.8.10/25"],
+     "additional": []},
+]
+
+
+def test_an_instance_is_found_by_its_bare_name(figo):
+    instance, error = figo.find_instance_by_reference(RECORDS_FOR_ADD, "alone")
+    assert error is None
+    assert instance["scope"] == "blade3:figo-x.alone"
+
+
+def test_the_same_name_in_two_projects_is_refused_not_guessed(figo):
+    """Which instance gets a public address is not a guess figo may make."""
+    instance, error = figo.find_instance_by_reference(RECORDS_FOR_ADD, "myinst")
+    assert instance is None
+    assert "more than one" in error
+
+
+def test_the_project_disambiguates(figo):
+    instance, error = figo.find_instance_by_reference(RECORDS_FOR_ADD, "figo-y.myinst")
+    assert error is None
+    assert instance["scope"] == "blade3:figo-y.myinst"
+
+
+def test_an_unknown_instance_says_where_to_look(figo):
+    instance, error = figo.find_instance_by_reference(RECORDS_FOR_ADD, "ghost")
+    assert instance is None
+    assert "instance list" in error
+
+
+def test_only_the_address_behind_this_gateway_counts(figo):
+    """The instance also holds an address on another subnet; a mapping on this
+    gateway can only point at the one behind it."""
+    assert figo.address_in_subnet(
+        ["10.202.9.222/25", "10.202.8.10/25"], "10.202.9.128/25") == ["10.202.9.222"]
+
+
+def test_an_instance_with_no_address_here_yields_nothing(figo):
+    assert figo.address_in_subnet(["10.202.8.10/25"], "10.202.9.128/25") == []
+
+
+def test_a_malformed_address_is_skipped_not_fatal(figo):
+    assert figo.address_in_subnet(
+        ["", "not-an-ip", "10.202.9.222/25"], "10.202.9.128/25") == ["10.202.9.222"]
+
+
+def test_add_needs_a_whitelist_or_all_ports_by_name(figo):
+    """A mapping written without 'allow' forwards everything: no instance should
+    be opened to the Internet because a flag was forgotten."""
+    with pytest.raises(ValueError):
+        figo.float_add_options("10.202.9.220")
+
+
+def test_all_ports_and_a_port_list_together_are_refused(figo):
+    with pytest.raises(ValueError):
+        figo.float_add_options("10.202.9.220", tcp="80", all_ports=True)
+
+
+def test_the_options_of_add_carry_the_private_address_first(figo):
+    assert figo.float_add_options(
+        "10.202.9.220", tcp="80,443", label="billing"
+    ) == ["--private", "10.202.9.220", "--tcp", "80,443", "--label", "billing"]
+
+
+def test_all_ports_is_passed_through_by_name(figo):
+    assert figo.float_add_options("10.202.9.220", all_ports=True) == [
+        "--private", "10.202.9.220", "--all-ports"]
+
+
+def test_adding_an_address_the_gateway_already_maps_is_refused(figo):
+    """For every other verb an absent mapping is the refusal; for 'add' the
+    present one is."""
+    refusals, _ = figo.float_write_decision(
+        "add", "160.80.105.36", row(public="160.80.105.36", private="10.202.9.211")
+    )
+    assert len(refusals) == 1
+    assert "10.202.9.211" in refusals[0]
+
+
+def test_adding_over_a_violated_invariant_is_refused(figo):
+    refusals, _ = figo.float_write_decision(
+        "add", "160.80.105.44", None,
+        figo.FLOAT_INVARIANT_VIOLATED, "'myinst' routes by default via 10.202.9.129."
+    )
+    assert len(refusals) == 1
+
+
+def test_adding_a_mapping_that_does_not_exist_yet_is_the_normal_case(figo):
+    refusals, warnings = figo.float_write_decision(
+        "add", "160.80.105.44", None, figo.FLOAT_INVARIANT_OK, "all good"
+    )
+    assert (refusals, warnings) == ([], [])
+
+
+def test_removing_a_mapping_the_gateway_does_not_have_is_refused(figo):
+    refusals, _ = figo.float_write_decision("remove", "160.80.105.99", None)
+    assert refusals and "add" in refusals[0]
+
+
+def test_removing_is_never_gated_on_the_invariant(figo):
+    refusals, _ = figo.float_write_decision(
+        "remove", "160.80.105.44", row(enabled=True, active=True),
+        figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
+    )
+    assert refusals == []

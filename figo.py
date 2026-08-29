@@ -7627,7 +7627,7 @@ def floating_ip_write_argv(scope, verb, public_ip, note=None, options=()):
 # The verbs that can start serving traffic. They are gated on the invariant;
 # 'disable' and 'close', which can only stop traffic, never are -- refusing to
 # stop a broken mapping would withhold the remedy from whoever is applying it.
-FLOAT_VERBS_THAT_SERVE = ('enable', 'open', 'replace')
+FLOAT_VERBS_THAT_SERVE = ('enable', 'open', 'replace', 'add')
 
 
 # The verbs that record who owns a mapping and why. They change no rule, so
@@ -7665,6 +7665,89 @@ def float_port_options(tcp=None, udp=None, icmp=None):
     for flag, value in (('--tcp', tcp), ('--udp', udp), ('--icmp', icmp)):
         if value:
             options += [flag, value]
+    return options
+
+
+def find_instance_by_reference(records, reference):
+    """Find the instance a mapping should point at, from what the operator typed.
+
+    Pure function. Accepts 'name', 'project.name' or 'remote:project.name', and
+    refuses an ambiguous reference instead of picking one: two instances with
+    the same name in different projects are ordinary here, and which of them
+    gets a public address is not a guess figo may make on its own.
+
+    Returns:
+        tuple: (instance, error). Exactly one of the two is not None.
+    """
+    wanted = reference.rpartition(':')[2]
+    project, _, name = wanted.partition('.')
+    if not name:
+        project, name = None, project
+
+    matches = [
+        record for record in records or []
+        if record['name'] == name and (project is None or record['project'] == project)
+    ]
+    if not matches:
+        return None, (
+            f"No instance '{reference}' on this remote: 'figo instance list' shows "
+            f"the ones figo can see."
+        )
+    if len(matches) > 1:
+        names = ", ".join(f"{m['project']}.{m['name']}" for m in matches)
+        return None, (
+            f"'{reference}' matches more than one instance ({names}): say which one "
+            f"as 'project.name'."
+        )
+    return matches[0], None
+
+
+def address_in_subnet(addresses, subnet):
+    """The addresses of an instance that belong to the gateway's subnet.
+
+    Pure function. An instance can hold several addresses, and only one of them
+    can be behind a given gateway; returning the list rather than a choice lets
+    the caller refuse an ambiguous case instead of mapping a public address to
+    whichever came first.
+    """
+    network = ipaddress.ip_network(subnet)
+    found = []
+    for address in addresses or []:
+        bare = address.split('/')[0]
+        try:
+            if ipaddress.ip_address(bare) in network:
+                found.append(bare)
+        except ValueError:
+            continue
+    return found
+
+
+def float_add_options(private, tcp=None, udp=None, icmp=None, label=None,
+                      all_ports=False):
+    """Build the options of 'add'.
+
+    Pure function. A mapping written with no 'allow' forwards everything to the
+    instance, so the gateway requires the whitelist to be stated -- or
+    '--all-ports' to be asked for by name. figo refuses the same way rather than
+    defaulting: no instance should be opened to the Internet because a flag was
+    forgotten.
+    """
+    if all_ports and (tcp or udp or icmp):
+        raise ValueError("--all-ports and a list of ports cannot both be given")
+
+    options = ['--private', private]
+    if all_ports:
+        options.append('--all-ports')
+    else:
+        ports = float_port_options(tcp, udp, icmp)
+        if not ports:
+            raise ValueError(
+                "one of --tcp, --udp, --icmp is required, or --all-ports to forward "
+                "everything"
+            )
+        options += ports
+    if label:
+        options += ['--label', label]
     return options
 
 
@@ -7733,6 +7816,33 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
     """
     refusals, warnings = [], []
 
+    def judge_invariant():
+        if invariant == FLOAT_INVARIANT_VIOLATED:
+            refusals.append(
+                f"{invariant_detail} Serving more traffic through {public_ip} would "
+                f"produce a mapping that looks right and does not work. Fix the "
+                f"default route of the instance first, or leave the mapping off."
+            )
+        elif invariant in (FLOAT_INVARIANT_UNKNOWN, FLOAT_INVARIANT_NOT_CHECKED):
+            warnings.append(
+                (invariant_detail or "The default-gateway invariant could not be checked.")
+                + f" figo cannot verify it, so it does not refuse: {public_ip} will be "
+                f"turned on and may not work. Check with 'figo net float show {public_ip}'."
+            )
+
+    # 'add' reads the presence of a mapping the other way round: for every other
+    # verb an absent mapping is the refusal, here it is the precondition.
+    if verb == 'add':
+        if row is not None:
+            refusals.append(
+                f"{public_ip} is already mapped to {row.get('private')}. "
+                f"'figo net float remove {public_ip}' deletes that mapping, and "
+                f"'figo net float replace' changes what it allows."
+            )
+        else:
+            judge_invariant()
+        return refusals, warnings
+
     if row is None:
         refusals.append(
             f"No mapping for {public_ip} on this gateway. 'figo net float list' "
@@ -7749,24 +7859,13 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
     if not serves_now:
         return refusals, warnings
 
-    if invariant == FLOAT_INVARIANT_VIOLATED:
-        refusals.append(
-            f"{invariant_detail} Serving more traffic through {public_ip} would "
-            f"produce a mapping that looks right and does not work. Fix the "
-            f"default route of the instance first, or leave the mapping off."
-        )
-    elif invariant in (FLOAT_INVARIANT_UNKNOWN, FLOAT_INVARIANT_NOT_CHECKED):
-        warnings.append(
-            (invariant_detail or "The default-gateway invariant could not be checked.")
-            + f" figo cannot verify it, so it does not refuse: {public_ip} will be "
-            f"turned on and may not work. Check with 'figo net float show {public_ip}'."
-        )
-
+    judge_invariant()
     return refusals, warnings
 
 
 def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=False,
-                        text=None, clear=False):
+                        text=None, clear=False, instance_reference=None,
+                        add_options=None):
     """Run one write verb of the gateway on a mapping, then apply and re-read.
 
     The single write path of figo towards a gateway. It reports what it
@@ -7780,7 +7879,7 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
     drift from it.
     """
     _subnets, gateways, warnings = figo_network()
-    _subnet, gateway, selection_warnings = select_gateway_for_remote(gateways, remote)
+    subnet, gateway, selection_warnings = select_gateway_for_remote(gateways, remote)
     for warning in warnings + selection_warnings:
         logger.warning(warning)
     if gateway is None:
@@ -7811,6 +7910,42 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
             dict(row, enabled=True), instance, gateway_read, gateway.get('address')
         )
 
+    # 'add' is the one verb whose target is named by the operator rather than
+    # read from the gateway: the mapping does not exist yet, so the instance,
+    # the private address and the options all have to be resolved first.
+    if verb == 'add' and row is None:
+        instance, error = find_instance_by_reference(records, instance_reference)
+        if error:
+            logger.error(error)
+            return
+
+        candidates = address_in_subnet(
+            list(instance.get('addresses') or []) + list(instance.get('additional') or []),
+            subnet
+        )
+        if len(candidates) != 1:
+            logger.error(
+                f"'{instance_reference}' holds {len(candidates)} addresses on {subnet} "
+                f"({', '.join(candidates) or 'none'}), and a mapping needs exactly one: "
+                f"a floating IP points at a single address behind this gateway."
+            )
+            return
+        private = candidates[0]
+
+        try:
+            options = float_add_options(private, **(add_options or {}))
+        except ValueError as e:
+            logger.error(f"'add' cannot be built: {e}.")
+            return
+
+        gateway_read = None
+        if instance['status'] == "Running":
+            gateway_read = probe_default_gateway(instance['scope'])
+        invariant, invariant_detail = float_invariant_status(
+            {'public': public_ip, 'private': private, 'enabled': True, 'active': False},
+            instance, gateway_read, gateway.get('address')
+        )
+
     refusals, write_warnings = float_write_decision(
         verb, public_ip, row, invariant, invariant_detail
     )
@@ -7821,7 +7956,7 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
             logger.error(refusal)
         return
 
-    if float_write_is_noop(verb, row, note, text=text, clear=clear):
+    if row is not None and float_write_is_noop(verb, row, note, text=text, clear=clear):
         if verb in FLOAT_VERBS_WITHOUT_RULES:
             current = row.get(verb)
             logger.info(
@@ -7885,6 +8020,20 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
         return
 
     new_row = next((m for m in after.mappings if m.get('public') == public_ip), None)
+
+    if verb == 'remove':
+        if new_row is not None:
+            logger.error(
+                f"{public_ip} is still on the gateway after 'remove', which should not "
+                f"happen: read it with 'figo net float show {public_ip}'."
+            )
+        else:
+            logger.info(
+                f"{public_ip} is gone. {len(after.mappings)} mapping(s) left on the "
+                f"gateway, rules reinstalled."
+            )
+        return
+
     if new_row is None:
         logger.warning(
             f"The change was applied but {public_ip} is no longer in the gateway's "
@@ -8520,6 +8669,67 @@ def create_net_parser(subparsers):
             help="Print the command figo would run in the gateway, and change nothing"
         )
 
+    float_add_parser = float_subparsers.add_parser(
+        "add",
+        help="Create a mapping towards an instance, and apply.",
+        description="Create a floating-IP mapping towards an instance, then install\n"
+                    "its rules. The public address is required and never guessed:\n"
+                    "figo knows the private subnets, but which public addresses are\n"
+                    "free is recorded nowhere, and there is more than one pool.\n"
+                    "One of --tcp, --udp, --icmp is required, or --all-ports asked for\n"
+                    "by name: a mapping written without them forwards everything.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float add myinst 160.80.105.44 --tcp 80,443\n"
+               "  figo net float add figo-x.myinst 160.80.105.44 --all-ports --dry-run"
+    )
+    float_add_parser.add_argument(
+        "instance", help="Instance the mapping points at: 'name' or 'project.name'"
+    )
+    float_add_parser.add_argument("public_ip", help="The public address to map")
+    float_add_parser.add_argument("--tcp", default=None, help="Comma-separated TCP ports")
+    float_add_parser.add_argument("--udp", default=None, help="Comma-separated UDP ports")
+    float_add_parser.add_argument(
+        "--icmp", default=None, help="ICMP type names, or 'all'"
+    )
+    float_add_parser.add_argument(
+        "--all-ports", action="store_true", dest="all_ports",
+        help="Forward everything to the instance, asked for by name"
+    )
+    float_add_parser.add_argument("--label", default=None, help="Who owns this mapping")
+    float_add_parser.add_argument(
+        "-r", "--remote", default="blade3",
+        help="Remote whose gateway will hold the mapping. Defaults to 'blade3'."
+    )
+    float_add_parser.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Print the commands figo would run in the gateway, and change nothing"
+    )
+
+    float_remove_parser = float_subparsers.add_parser(
+        "remove",
+        help="Delete a mapping, and apply.",
+        description="Delete a floating-IP mapping and reinstall the rules. The gateway\n"
+                    "takes the comment lines above the mapping with it -- left behind\n"
+                    "they would sit above the next one and name the wrong owner -- and\n"
+                    "leaves a backup.\n"
+                    "Never refused on the default-gateway invariant: removing a mapping\n"
+                    "only takes traffic away.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float remove 160.80.105.44\n"
+               "  figo net float remove 160.80.105.44 --dry-run"
+    )
+    float_remove_parser.add_argument("public_ip", help="The public address of the mapping")
+    float_remove_parser.add_argument(
+        "-r", "--remote", default="blade3",
+        help="Remote whose gateway holds the mapping. Defaults to 'blade3'."
+    )
+    float_remove_parser.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Print the commands figo would run in the gateway, and change nothing"
+    )
+
     return net_parser
 
 
@@ -8714,6 +8924,16 @@ def handle_net_command(args, parser_dict):
             write_float_mapping(fix_remote_name(args.remote), args.float_command,
                                 args.public_ip,
                                 note=getattr(args, 'note', None),
+                                dry_run=args.dry_run)
+        elif args.float_command == "add":
+            write_float_mapping(
+                fix_remote_name(args.remote), "add", args.public_ip,
+                instance_reference=args.instance,
+                add_options={'tcp': args.tcp, 'udp': args.udp, 'icmp': args.icmp,
+                             'label': args.label, 'all_ports': args.all_ports},
+                dry_run=args.dry_run)
+        elif args.float_command == "remove":
+            write_float_mapping(fix_remote_name(args.remote), "remove", args.public_ip,
                                 dry_run=args.dry_run)
         elif args.float_command in ["label", "note"]:
             try:
