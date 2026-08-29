@@ -222,3 +222,64 @@ def test_a_mapping_with_no_allow_says_everything(figo):
     assert figo.format_allow({"mode": "open"}) == "everything (no allow)"
     assert figo.format_allow(
         {"mode": "whitelist", "tcp": [], "udp": [], "icmp": []}) == "nothing"
+
+
+# --- Bookkeeping: the verbs that change no rule -----------------------------
+
+def test_a_text_with_spaces_stays_one_argument(figo):
+    argv = figo.floating_ip_write_argv(
+        "blade3:default.gw-float", "note", "160.80.105.43",
+        options=figo.float_bookkeeping_options("port 22 not allowed upstream yet")
+    )
+    assert argv[-2:] == ["160.80.105.43", "port 22 not allowed upstream yet"]
+
+
+def test_clearing_is_its_own_option(figo):
+    assert figo.float_bookkeeping_options(clear=True) == ["--clear"]
+
+
+def test_a_text_and_clear_together_is_an_error(figo):
+    """Not a precedence rule: a label cleared by accident is an owner lost."""
+    with pytest.raises(ValueError):
+        figo.float_bookkeeping_options("web-team", clear=True)
+
+
+def test_neither_a_text_nor_clear_is_an_error(figo):
+    with pytest.raises(ValueError):
+        figo.float_bookkeeping_options()
+
+
+def test_writing_the_label_that_is_already_there_changes_nothing(figo):
+    labelled = dict(row(), label="web-team")
+    assert figo.float_write_is_noop("label", labelled, text="web-team") is True
+    assert figo.float_write_is_noop("label", labelled, text="billing") is False
+
+
+def test_clearing_a_label_that_is_not_there_changes_nothing(figo):
+    assert figo.float_write_is_noop("label", row(), clear=True) is True
+
+
+def test_clearing_a_label_that_is_there_is_a_change(figo):
+    assert figo.float_write_is_noop(
+        "label", dict(row(), label="web-team"), clear=True) is False
+
+
+def test_bookkeeping_is_never_gated_on_the_invariant(figo):
+    """These verbs move no packet: gating them would refuse to record why a
+    mapping is broken exactly when someone is trying to write it down."""
+    refusals, warnings = figo.float_write_decision(
+        "note", "160.80.105.43", row(enabled=True, active=True),
+        figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
+    )
+    assert (refusals, warnings) == ([], [])
+
+
+def test_clearing_is_compared_against_emptiness_not_against_the_text(figo):
+    """A surviving mutant found this gap: with --clear, the value figo compares
+    the current label against is 'nothing', never the text that came with it.
+    The CLI cannot send both today -- float_bookkeeping_options refuses -- but
+    the rule belongs to the function that decides, not to its caller.
+    """
+    labelled = dict(row(), label="web-team")
+    assert figo.float_write_is_noop(
+        "label", labelled, text="web-team", clear=True) is False

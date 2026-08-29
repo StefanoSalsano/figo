@@ -7630,6 +7630,29 @@ def floating_ip_write_argv(scope, verb, public_ip, note=None, options=()):
 FLOAT_VERBS_THAT_SERVE = ('enable', 'open', 'replace')
 
 
+# The verbs that record who owns a mapping and why. They change no rule, so
+# they are the only writes figo does not follow with an apply -- and the only
+# ones that can be run against a live gateway without a flush window.
+FLOAT_VERBS_WITHOUT_RULES = ('label', 'note')
+
+
+def float_bookkeeping_options(text=None, clear=False):
+    """Build the argument of 'label' and 'note': the text, or --clear.
+
+    Pure function. Exactly one of the two, and giving both is an error rather
+    than a precedence rule: a bookkeeping field says who owns a mapping and why
+    it is the way it is, and clearing one by accident loses a fact nobody
+    recorded twice.
+    """
+    if clear:
+        if text:
+            raise ValueError("a text and --clear cannot both be given")
+        return ['--clear']
+    if not text:
+        raise ValueError("a text is required unless --clear is given")
+    return [text]
+
+
 def float_port_options(tcp=None, udp=None, icmp=None):
     """Build the protocol options of a port verb, in a stable order.
 
@@ -7645,15 +7668,18 @@ def float_port_options(tcp=None, udp=None, icmp=None):
     return options
 
 
-def float_write_is_noop(verb, row, note=None):
+def float_write_is_noop(verb, row, note=None, text=None, clear=False):
     """True when figo can already tell the write would change nothing.
 
-    Pure function, and deliberately narrow: 'enable' and 'disable' are one
-    boolean figo has in hand, so it can skip the verb and the apply. What
-    'open' or 'replace' would change is a list the gateway renders in its own
-    style, and deciding here whether that is a no-op would mean re-implementing
-    its semantics in a second place. A note is always a change: it is written
-    even when the state already matches.
+    Pure function, and deliberately narrow: it answers only where the whole
+    effect of the verb is a single value figo has already read -- the boolean of
+    'enable' and 'disable', the string of 'label' and 'note'. What 'open' or
+    'replace' would change is a list the gateway renders in its own style, and
+    deciding here whether that is a no-op would mean re-implementing its
+    semantics in a second place.
+
+    A note passed to 'disable' is always a change: it is written even when the
+    state already matches, which is the point of recording why.
     """
     if note is not None:
         return False
@@ -7661,6 +7687,8 @@ def float_write_is_noop(verb, row, note=None):
         return bool(row.get('enabled'))
     if verb == 'disable':
         return not row.get('enabled')
+    if verb in FLOAT_VERBS_WITHOUT_RULES:
+        return row.get(verb) == (None if clear else text)
     return False
 
 
@@ -7737,7 +7765,8 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
     return refusals, warnings
 
 
-def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=False):
+def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=False,
+                        text=None, clear=False):
     """Run one write verb of the gateway on a mapping, then apply and re-read.
 
     The single write path of figo towards a gateway. It reports what it
@@ -7792,20 +7821,33 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
             logger.error(refusal)
         return
 
-    if float_write_is_noop(verb, row, note):
-        state = 'enabled' if verb == 'enable' else 'disabled'
-        logger.info(
-            f"{public_ip} is already {state}: nothing to do, and nothing applied."
-        )
+    if float_write_is_noop(verb, row, note, text=text, clear=clear):
+        if verb in FLOAT_VERBS_WITHOUT_RULES:
+            current = row.get(verb)
+            logger.info(
+                f"The {verb} of {public_ip} is already "
+                + (f"'{current}'" if current else "empty")
+                + ": nothing to do."
+            )
+        else:
+            state = 'enabled' if verb == 'enable' else 'disabled'
+            logger.info(
+                f"{public_ip} is already {state}: nothing to do, and nothing applied."
+            )
         return
 
     argv = floating_ip_write_argv(gateway['scope'], verb, public_ip, note, options)
     apply_argv = incus_exec_argv(gateway['scope'], ['floating-ip', 'apply'])
 
+    changes_rules = verb not in FLOAT_VERBS_WITHOUT_RULES
+
     if dry_run:
         logger.info("Dry run: nothing was changed. figo would run, in this order:")
         logger.info("  " + " ".join(argv))
-        logger.info("  " + " ".join(apply_argv))
+        if changes_rules:
+            logger.info("  " + " ".join(apply_argv))
+        else:
+            logger.info(f"  (and no apply: '{verb}' changes no rule)")
         return
 
     result = subprocess.run(argv, capture_output=True, text=True)
@@ -7819,8 +7861,11 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
         )
         return
 
-    applied = subprocess.run(apply_argv, capture_output=True, text=True)
-    if applied.returncode != 0:
+    if changes_rules:
+        applied = subprocess.run(apply_argv, capture_output=True, text=True)
+    else:
+        applied = None
+    if applied is not None and applied.returncode != 0:
         logger.error(
             f"The configuration was changed but 'floating-ip apply' failed: "
             f"{(applied.stderr or applied.stdout or '').strip()}. The gateway now asks "
@@ -7841,6 +7886,15 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
         logger.warning(
             f"The change was applied but {public_ip} is no longer in the gateway's "
             f"answer, which should not happen: read it with 'figo net float list'."
+        )
+        return
+
+    if not changes_rules:
+        value = new_row.get(verb)
+        logger.info(
+            f"The {verb} of {public_ip} is now "
+            + (f"'{value}'." if value else "empty.")
+            + " No rule changed, so nothing was applied."
         )
         return
 
@@ -8431,6 +8485,38 @@ def create_net_parser(subparsers):
             help="Print the commands figo would run in the gateway, and change nothing"
         )
 
+    for verb, what in (
+        ("label", "who owns a mapping"),
+        ("note", "why a mapping is the way it is"),
+    ):
+        book_parser = float_subparsers.add_parser(
+            verb,
+            help=f"Record {what}.",
+            description=f"Record {what}, in the mapping itself.\n"
+                        "Until these fields existed the only record was a YAML comment,\n"
+                        "which no program could read and any rewrite could lose.\n"
+                        "Changes no rule, so nothing is applied and no traffic is touched.",
+            formatter_class=argparse.RawTextHelpFormatter,
+            epilog="Examples:\n"
+                   f"  figo net float {verb} 160.80.105.36 \"web-team\"\n"
+                   f"  figo net float {verb} 160.80.105.36 --clear"
+        )
+        book_parser.add_argument("public_ip", help="The public address of the mapping")
+        book_parser.add_argument(
+            "text", nargs="?", default=None, help=f"The {verb} to record"
+        )
+        book_parser.add_argument(
+            "--clear", action="store_true", help=f"Remove the {verb} instead"
+        )
+        book_parser.add_argument(
+            "-r", "--remote", default="blade3",
+            help="Remote whose gateway holds the mapping. Defaults to 'blade3'."
+        )
+        book_parser.add_argument(
+            "--dry-run", action="store_true", dest="dry_run",
+            help="Print the command figo would run in the gateway, and change nothing"
+        )
+
     return net_parser
 
 
@@ -8626,6 +8712,18 @@ def handle_net_command(args, parser_dict):
                                 args.public_ip,
                                 note=getattr(args, 'note', None),
                                 dry_run=args.dry_run)
+        elif args.float_command in ["label", "note"]:
+            try:
+                options = float_bookkeeping_options(args.text, args.clear)
+            except ValueError as e:
+                logger.error(
+                    f"'{args.float_command}' takes a text or --clear: {e}."
+                )
+            else:
+                write_float_mapping(fix_remote_name(args.remote), args.float_command,
+                                    args.public_ip, options=options,
+                                    text=args.text, clear=args.clear,
+                                    dry_run=args.dry_run)
         elif args.float_command in ["open", "close", "replace"]:
             options = float_port_options(args.tcp, args.udp, args.icmp)
             if not options:
