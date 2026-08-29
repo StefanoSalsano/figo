@@ -1387,6 +1387,217 @@ def subnet_of_remote(remote_info):
         return None
 
 
+UPSTREAM_CONFIDENCE = ('verified', 'declared', 'suspected')
+UPSTREAM_EFFECTS = ('blocked', 'allowed')
+UPSTREAM_PROTOCOLS = ('tcp', 'udp', 'icmp')
+
+
+def parse_upstream_policy(config, today=None):
+    """Read 'upstream_policy' into normalised assertions about the outside world.
+
+    Pure function. Section 7.2: what the external network permits is knowledge
+    figo holds on somebody else's word. It cannot be measured from inside the
+    testbed (7.5), so it is never a refusal -- only a warning that names who
+    said it and when, so the reader can judge it.
+
+    Two rules are enforced here instead of being left to whoever writes the
+    file, because both failures are silent:
+
+    - an entry without a date, a source or a confidence level is dropped. A
+      policy file with no provenance looks authoritative and cannot be judged,
+      which is worse than not having the entry at all.
+    - the scope is read exactly as written and never widened. An assertion
+      stated more broadly than it was verified produces false warnings, and
+      false warnings train people to ignore warnings. The network model got
+      this wrong once, generalising a comment about one address to a whole /24
+      that was later shown to allow the port.
+
+    Returns:
+        tuple: (entries, warnings). Each entry carries 'public_ip' or
+               'public_range', 'protocol', 'ports', 'effect', 'confidence',
+               'source', 'date' and 'note'.
+    """
+    warnings = []
+    entries = []
+
+    section = (config or {}).get('upstream_policy')
+    if section is None:
+        return [], warnings
+    if not isinstance(section, list):
+        return [], ["'upstream_policy' is not a list: ignored."]
+
+    for position, raw in enumerate(section, start=1):
+        where = f"upstream_policy entry {position}"
+        if not isinstance(raw, dict):
+            warnings.append(f"{where} is not a mapping: ignored.")
+            continue
+
+        scope = raw.get('scope') or {}
+        public_ip, public_range = None, None
+        if isinstance(scope, dict) and scope.get('public_ip'):
+            try:
+                public_ip = str(ipaddress.ip_address(str(scope['public_ip'])))
+            except ValueError:
+                warnings.append(f"{where}: '{scope['public_ip']}' is not an address: ignored.")
+                continue
+        elif isinstance(scope, dict) and scope.get('public_range'):
+            try:
+                public_range = str(ipaddress.ip_network(str(scope['public_range']), strict=False))
+            except ValueError:
+                warnings.append(f"{where}: '{scope['public_range']}' is not a subnet: ignored.")
+                continue
+        else:
+            warnings.append(
+                f"{where} has no scope: an assertion about 'the network' cannot be "
+                f"judged, and would warn about every mapping. Ignored."
+            )
+            continue
+
+        protocol = str(raw.get('protocol') or '').lower()
+        if protocol not in UPSTREAM_PROTOCOLS:
+            warnings.append(f"{where}: unknown protocol '{raw.get('protocol')}': ignored.")
+            continue
+
+        ports = []
+        if protocol != 'icmp':
+            declared = raw.get('ports')
+            if not isinstance(declared, list) or not declared:
+                warnings.append(
+                    f"{where}: {protocol} needs a list of ports; an entry about every "
+                    f"port of an address is broader than anything anyone verified. Ignored."
+                )
+                continue
+            for port in declared:
+                try:
+                    number = int(port)
+                except (TypeError, ValueError):
+                    number = -1
+                if not 1 <= number <= 65535:
+                    warnings.append(f"{where}: '{port}' is not a port: ignored.")
+                    number = None
+                if number:
+                    ports.append(number)
+            if not ports:
+                continue
+
+        effect = str(raw.get('effect') or '').lower()
+        if effect not in UPSTREAM_EFFECTS:
+            warnings.append(f"{where}: 'effect' must be blocked or allowed: ignored.")
+            continue
+
+        confidence = str(raw.get('confidence') or '').lower()
+        if confidence not in UPSTREAM_CONFIDENCE:
+            warnings.append(
+                f"{where}: 'confidence' must be verified, declared or suspected. "
+                f"Without it the warning cannot say how much to trust it. Ignored."
+            )
+            continue
+
+        source = str(raw.get('source') or '').strip()
+        if not source:
+            warnings.append(
+                f"{where}: 'source' is required. A constraint nobody is named for "
+                f"cannot be questioned, only obeyed. Ignored."
+            )
+            continue
+
+        date = str(raw.get('date') or '').strip()
+        try:
+            datetime.date.fromisoformat(date)
+        except ValueError:
+            warnings.append(
+                f"{where}: 'date' must be a date (YYYY-MM-DD). This knowledge decays, "
+                f"and an undated assertion looks authoritative forever. Ignored."
+            )
+            continue
+
+        entries.append({
+            'public_ip': public_ip,
+            'public_range': public_range,
+            'protocol': protocol,
+            'ports': ports,
+            'direction': str(raw.get('direction') or '').lower() or None,
+            'effect': effect,
+            'confidence': confidence,
+            'source': source,
+            'date': date,
+            'note': raw.get('note'),
+        })
+
+    return entries, warnings
+
+
+def upstream_constraints(entries, public_ip, protocol, public_ports=()):
+    """The policy entries that bear on these ports of this address.
+
+    Pure function. Matching is containment on the address and exact on the
+    ports: an entry about port 22 says nothing about port 80, and one about an
+    address says nothing about its neighbour. Widening either would be the
+    false-warning failure Section 7.2 warns against.
+
+    Returns:
+        list: (entry, matched ports) pairs, in the order the entries were read.
+    """
+    try:
+        address = ipaddress.ip_address(public_ip)
+    except ValueError:
+        return []
+
+    matches = []
+    for entry in entries or []:
+        if entry['protocol'] != protocol:
+            continue
+        if entry['public_ip'] is not None:
+            if entry['public_ip'] != str(address):
+                continue
+        elif address not in ipaddress.ip_network(entry['public_range']):
+            continue
+
+        if protocol == 'icmp':
+            matches.append((entry, []))
+            continue
+
+        hit = sorted(set(entry['ports']) & set(int(port) for port in public_ports or []))
+        if hit:
+            matches.append((entry, hit))
+
+    return matches
+
+
+def format_upstream_warning(entry, ports=(), today=None):
+    """Render one constraint as a warning that can be judged rather than obeyed.
+
+    Pure function. It says three things the reader needs and one they do not
+    get anywhere else: what is reported, who reported it, and how old that is.
+    'declared' and 'suspected' say plainly that nobody measured it -- the
+    testbed has no vantage point from which to (7.5).
+    """
+    what = entry['protocol']
+    if ports:
+        what += "/" + ",".join(str(port) for port in ports)
+
+    where = entry['public_ip'] or entry['public_range']
+    today = today or datetime.date.today()
+    age = (today - datetime.date.fromisoformat(entry['date'])).days
+    when = f"recorded {entry['date']}"
+    if age > 0:
+        when += f", {age} day{'s' if age != 1 else ''} ago"
+
+    how = {
+        'verified': "measured from outside on that date",
+        'declared': "stated by whoever administers the network, never tested",
+        'suspected': "inferred, never confirmed",
+    }[entry['confidence']]
+
+    message = (
+        f"{what} towards {where} is reported {entry['effect']} upstream "
+        f"({entry['confidence']}: {how}; source \"{entry['source']}\", {when})."
+    )
+    if entry.get('note'):
+        message += f" Note: {entry['note']}."
+    return message
+
+
 def parse_network_config(config):
     """Read the 'network' section of the configuration into normalised form.
 
