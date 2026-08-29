@@ -49,3 +49,42 @@ network:
     "10.202.128.128/25":
       host: figo-2gpu
       public_vlan: false
+
+# What the network outside the testbed permits (figo-network-model.md 7.2).
+#
+# figo refuses what it can check itself -- the default gateway of an instance,
+# the subnet of a gateway -- and only WARNS about what it holds on somebody
+# else's word. Nothing here can be measured from inside the testbed: every
+# machine is on the wrong side of the constraint (7.5), so an entry is never a
+# reason to refuse an operation.
+#
+# Every assertion must say who reported it and when, and how well it is known:
+#   verified   measured from outside, on the recorded date
+#   declared   stated by whoever administers the network, never tested
+#   suspected  inferred, never confirmed
+# An entry without 'source', 'date' or 'confidence' is dropped with a warning:
+# a policy file with no provenance looks authoritative and cannot be judged.
+#
+# Keep the scope as narrow as it was actually observed. An assertion stated
+# more broadly than anyone verified produces false warnings, and false warnings
+# train people to ignore warnings -- this file's first draft said the whole
+# /24 blocked port 22, and an ssh session from outside to 160.80.105.87:22 on
+# 2026-08-26 showed that it does not.
+upstream_policy:
+  - scope: { public_ip: "160.80.105.43" }
+    protocol: tcp
+    ports: [22]
+    effect: blocked
+    confidence: declared
+    source: "CDC - recorded in the gw-float config.yaml"
+    date: 2026-08-26
+    note: "the reason mapping .43 is disabled"
+
+  - scope: { public_range: "160.80.105.0/24" }
+    protocol: icmp
+    direction: inbound
+    effect: blocked
+    confidence: declared
+    source: "Stefano Salsano"
+    date: 2026-08-26
+    note: "inbound ICMP is filtered by the university network, so the icmp field of a mapping has no observable effect"

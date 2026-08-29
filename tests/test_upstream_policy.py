@@ -17,6 +17,12 @@ import datetime
 import pytest
 
 
+def row(public="160.80.105.43", private="10.202.9.211", enabled=False, active=False):
+    return {"public": public, "private": private, "enabled": enabled, "active": active,
+            "mode": "whitelist", "tcp": [], "udp": [], "icmp": [], "icmp_all": False,
+            "label": None, "note": None, "drift": None}
+
+
 TODAY = datetime.date(2026, 8, 29)
 
 
@@ -172,3 +178,49 @@ def test_a_note_is_carried_into_the_warning(figo):
     entries, _ = figo.parse_upstream_policy(policy(note="reason .43 is disabled"))
     assert "reason .43 is disabled" in figo.format_upstream_warning(
         entries[0], [22], today=TODAY)
+
+
+# --- Where the constraint reaches the operator ------------------------------
+
+def test_the_public_side_of_a_remapped_port_is_what_upstream_sees(figo):
+    """'8443:443' is public 8443; a constraint about 443 does not apply to it."""
+    assert figo.public_ports_of("80,8443:443, 22 ") == [80, 8443, 22]
+    assert figo.public_ports_of(None) == []
+    assert figo.public_ports_of("80,nonsense") == [80]
+
+
+def test_a_blocked_port_warns_and_lets_the_write_through(figo):
+    """Section 7.3 in one assertion: figo warns about what it was told, and
+    does not stand in the way. The day the CDC opens port 22, figo must not be
+    the obstacle, and nobody will remember to update the file first."""
+    entries, _ = figo.parse_upstream_policy(policy())
+    matches = figo.upstream_constraints(entries, "160.80.105.43", "tcp", [22])
+    refusals, warnings = figo.float_write_decision(
+        "add", "160.80.105.43", None, figo.FLOAT_INVARIANT_OK, "fine", matches
+    )
+    assert refusals == []
+    assert len(warnings) == 1
+    assert "tcp/22" in warnings[0]
+    assert "may not be reachable from outside" in warnings[0]
+
+
+def test_an_allowed_entry_says_nothing(figo):
+    """The file can record what works too; only 'blocked' is worth a warning."""
+    entries, _ = figo.parse_upstream_policy(policy(effect="allowed"))
+    matches = figo.upstream_constraints(entries, "160.80.105.43", "tcp", [22])
+    _refusals, warnings = figo.float_write_decision(
+        "add", "160.80.105.43", None, figo.FLOAT_INVARIANT_OK, "fine", matches
+    )
+    assert warnings == []
+
+
+def test_a_constraint_never_becomes_a_refusal(figo):
+    """Even 'verified' does not block: it is still not figo's measurement."""
+    entries, _ = figo.parse_upstream_policy(policy(confidence="verified"))
+    matches = figo.upstream_constraints(entries, "160.80.105.43", "tcp", [22])
+    refusals, warnings = figo.float_write_decision(
+        "open", "160.80.105.43", row(enabled=True, active=True),
+        figo.FLOAT_INVARIANT_OK, "fine", matches
+    )
+    assert refusals == []
+    assert warnings

@@ -7864,6 +7864,26 @@ def float_bookkeeping_options(text=None, clear=False):
     return [text]
 
 
+def public_ports_of(spec):
+    """The public side of a port list, as the operator typed it. Pure function.
+
+    '8443:443' maps public 8443 to private 443, and what the outside network
+    sees -- the only thing an upstream constraint can be about -- is the public
+    one. Unparseable items are skipped here and refused by the gateway, which
+    owns that syntax.
+    """
+    ports = []
+    for item in (spec or '').split(','):
+        head = item.strip().split(':')[0].strip()
+        if not head:
+            continue
+        try:
+            ports.append(int(head))
+        except ValueError:
+            continue
+    return ports
+
+
 def float_port_options(tcp=None, udp=None, icmp=None):
     """Build the protocol options of a port verb, in a stable order.
 
@@ -8006,7 +8026,8 @@ def format_allow(mapping):
     return "; ".join(parts) or "nothing"
 
 
-def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=None):
+def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=None,
+                         upstream=()):
     """Decide whether figo may run a write verb on a mapping, and say why not.
 
     Pure function. 'row' is the joined row for that public address, or None when
@@ -8026,6 +8047,16 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
         tuple: (refusals, warnings). No refusals means the write may proceed.
     """
     refusals, warnings = [], []
+
+    for entry, ports in upstream or []:
+        if entry.get('effect') != 'blocked':
+            continue
+        warnings.append(
+            format_upstream_warning(entry, ports)
+            + f" The mapping will be created and will look correct; it may not be "
+            f"reachable from outside. figo cannot test that from inside the testbed: "
+            f"every machine here is on the wrong side of the constraint."
+        )
 
     def as_sentence(text):
         """One message is built from two, and the first does not always end in a
@@ -8085,7 +8116,7 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
 
 def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=False,
                         text=None, clear=False, instance_reference=None,
-                        add_options=None):
+                        add_options=None, requested=None):
     """Run one write verb of the gateway on a mapping, then apply and re-read.
 
     The single write path of figo towards a gateway. It reports what it
@@ -8166,8 +8197,20 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
             instance, gateway_read, gateway.get('address')
         )
 
+    upstream = []
+    if requested and verb in FLOAT_VERBS_THAT_SERVE:
+        policy, policy_warnings = parse_upstream_policy(load_figo_config())
+        for warning in policy_warnings:
+            logger.warning(warning)
+        for protocol in ('tcp', 'udp'):
+            upstream += upstream_constraints(
+                policy, public_ip, protocol, public_ports_of(requested.get(protocol))
+            )
+        if requested.get('icmp'):
+            upstream += upstream_constraints(policy, public_ip, 'icmp')
+
     refusals, write_warnings = float_write_decision(
-        verb, public_ip, row, invariant, invariant_detail
+        verb, public_ip, row, invariant, invariant_detail, upstream
     )
     for warning in write_warnings:
         logger.warning(warning)
@@ -9151,6 +9194,7 @@ def handle_net_command(args, parser_dict):
                 instance_reference=args.instance,
                 add_options={'tcp': args.tcp, 'udp': args.udp, 'icmp': args.icmp,
                              'label': args.label, 'all_ports': args.all_ports},
+                requested={'tcp': args.tcp, 'udp': args.udp, 'icmp': args.icmp},
                 dry_run=args.dry_run)
         elif args.float_command == "remove":
             write_float_mapping(fix_remote_name(args.remote), "remove", args.public_ip,
@@ -9169,6 +9213,7 @@ def handle_net_command(args, parser_dict):
                                     dry_run=args.dry_run)
         elif args.float_command in ["open", "close", "replace"]:
             options = float_port_options(args.tcp, args.udp, args.icmp)
+            requested = {'tcp': args.tcp, 'udp': args.udp, 'icmp': args.icmp}
             if not options:
                 logger.error(
                     f"'{args.float_command}' needs at least one of --tcp, --udp or "
@@ -9178,7 +9223,7 @@ def handle_net_command(args, parser_dict):
             else:
                 write_float_mapping(fix_remote_name(args.remote), args.float_command,
                                     args.public_ip, options=options,
-                                    dry_run=args.dry_run)
+                                    requested=requested, dry_run=args.dry_run)
 
 
 def handle_gpu_command(args, parser_dict):
