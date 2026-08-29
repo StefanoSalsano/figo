@@ -881,6 +881,57 @@ def get_ip_device_pairs(instance):
 
         return ip_device_pairs
 
+def live_ip_device_pairs(instance):
+    """The addresses an instance actually holds, as (address, device) pairs.
+
+    Pure function, and the counterpart of get_ip_device_pairs: that one reads
+    'user.network-config', which is what figo *asked* for. This one reads the
+    state 'incus list -f json' already returns, which is what the instance
+    *has*. The two are not the same thing and have been silently conflated:
+    a request only becomes a fact if something inside the instance applies it.
+
+    Measured on 2026-08-29: a container created from an image without
+    cloud-init ignored the configuration entirely and took a DHCP address,
+    while every figo view kept showing the address figo had written.
+
+    A stopped instance has no state and yields nothing -- which is the honest
+    answer, not an empty list meaning 'no addresses'.
+    """
+    pairs = []
+    network = ((instance or {}).get("state") or {}).get("network") or {}
+    if not isinstance(network, dict):
+        return pairs
+
+    # The filter is the scope, not the interface name. Measured on blade3 on
+    # 2026-08-29: incus reports the loopback addresses as scope 'local' and the
+    # IPv6 link-local ones as 'link', so excluding 'lo' by name would be a
+    # second rule saying less than this one -- and it would miss a local-scope
+    # address on any other interface.
+    for _device, entry in network.items():
+        for address in (entry or {}).get("addresses") or []:
+            if address.get("family") != "inet":
+                continue
+            if address.get("scope") not in (None, "global"):
+                continue
+            value = address.get("address")
+            if value:
+                pairs.append((value, _device))
+    return pairs
+
+
+def address_divergence(configured_pairs, live_pairs):
+    """The configured addresses an instance is not actually holding.
+
+    Pure function. Only meaningful for a running instance: with no live
+    addresses at all the question was not asked, and the answer is an empty
+    list rather than 'all of them are missing'.
+    """
+    if not live_pairs:
+        return []
+    live = {address for address, _device in live_pairs}
+    return [address for address, _device in configured_pairs or [] if address.split('/')[0] not in live]
+
+
 def get_ip_addresses(instance):
     """Return a list of IP addresses for the instance."""
     ip_device_pairs = get_ip_device_pairs(instance)
@@ -994,6 +1045,8 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
     if instances is None:
         return False  # Exit if fetching the instances failed
 
+    divergences = []
+
     # Iterate through instances and print their details in columns
     for instance in instances:
         name = instance.get("name", "Unknown")
@@ -1011,6 +1064,13 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
         # Additional IP addresses held by the instance (nested VMs, inner containers, extra
         # addresses on its own NIC). See ADDITIONAL_IPS_KEY.
         additional_entries = get_additional_ips_from_config(instance.get("config"))
+
+        live_pairs = live_ip_device_pairs(instance)
+        live_str = format_ip_device_pairs(live_pairs) if live_pairs else "-"
+        missing = address_divergence(ip_device_pairs, live_pairs)
+        if missing:
+            live_str += "  <--"
+            divergences.append((name, context, ", ".join(missing), live_str))
 
         ip_str = format_ip_device_pairs(ip_device_pairs)
         if additional_entries:
@@ -1034,12 +1094,13 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
         name_field = f"{context}.{name}" if join else name
 
         def build_row(instance_field, type_field, state_field, context_field,
-                      ip_field, name_col, mac_col, profiles_field):
+                      ip_field, name_col, mac_col, profiles_field, live_field=''):
             """Assemble a row matching the columns selected in list_instances."""
             row = [instance_field, type_field, state_field]
             if not join:
                 row.append(context_field)
             row.append(ip_field)
+            row.append(live_field)
             if additional:
                 # With -a the profiles are dropped: see the note in list_instances.
                 row.extend([name_col, mac_col])
@@ -1048,7 +1109,8 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
             return row
 
         add_row_to_output(COLS,
-                          build_row(name_field, instance_type, state, context, ip_str, '', '', profiles_str),
+                          build_row(name_field, instance_type, state, context, ip_str, '', '',
+                                    profiles_str, live_str),
                           reset_color=reset_color and not additional)
 
         if additional:
@@ -1059,7 +1121,14 @@ def get_and_print_instances(COLS, remote_node=None, project_name=None, instance_
             for entry in additional_entries:
                 add_row_to_output(COLS,
                                   build_row(name_field, 'additional_ip', '', '', entry['ip'],
-                                            entry['name'] or '', entry['mac'] or '', ''))
+                                            entry['name'] or '', entry['mac'] or '', '', ''))
+
+    for name, context, missing, _live in divergences:
+        logger.warning(
+            f"'{context}.{name}' does not hold {missing}: that address is what the "
+            f"configuration asks for, not what the instance has. An image without "
+            f"cloud-init ignores it and takes a DHCP address instead."
+        )
     return True
     
 
@@ -1089,7 +1158,11 @@ def list_instances(remote_node=None, project_name=None, instance_scope=None, ful
         COLS = [('INSTANCE WITH CONTEXT',35), ('TYPE', 13 if additional else 4), ('STATE',5)]
     else:
         COLS = [('INSTANCE',16), ('TYPE', 13 if additional else 4), ('STATE',5), ('CONTEXT',25)]
-    COLS.append(('IP ADDRESS(ES)',25))
+    # Two columns, not one: the first is what the configuration asks for, the
+    # second what the instance actually holds. They agree in the ordinary case
+    # and the difference between them is a fault nobody could see before.
+    COLS.append(('IP REQUESTED',22))
+    COLS.append(('IP ACTUAL',22))
     if additional:
         # The profiles column is dropped in this view: it is empty by definition on the address
         # rows, and the room taken by TYPE, NAME and MAC already pushes the line close to the
@@ -3382,7 +3455,11 @@ def create_instance(instance_name, image, remote_name, project, instance_type,
             logger.error(f"Failed to assign IP address and gateway: {e}")
             return False
 
-        logger.info(f"IP address: {ip_address_and_prefix_len}, Gateway: {gw_address}")
+        logger.info(
+            f"Requested IP address: {ip_address_and_prefix_len}, gateway: {gw_address}. "
+            f"This is written as cloud-init configuration and takes effect only if the "
+            f"image runs cloud-init: check it with 'figo instance list' once started."
+        )
 
         final_profiles = ['default'] + profiles  # Add default and instance size profiles   
         # Create the instance configuration
