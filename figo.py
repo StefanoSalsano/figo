@@ -1604,16 +1604,32 @@ def incus_exec_argv(scope, command):
 def parse_floating_ip_list(stdout):
     """Read the JSON of 'floating-ip list --json' into a list of mappings.
 
-    Pure function. Shape measured on blade3 on 2026-08-27:
+    Pure function. Shape measured on blade3 on 2026-08-28, after the gateway
+    was upgraded to the tree that carries the write verbs:
 
-        {"mappings": [{"public", "private", "enabled", "mode",
-                       "allow": {"tcp": [{"pub_port", "priv_port"}], "icmp": [...]},
-                       "active"}]}
+        {"mappings": [{"public", "private", "enabled", "mode", "active",
+                       "label", "note",
+                       "allow": {"tcp": [{"pub_port", "priv_port"}],
+                                 "icmp": ["echo-reply"] | "all"},
+                       "drift": {"missing", "extra", "consistent"}}],
+         "drift_summary": {"consistent", "inconsistent", "extra_rules"}}
 
     'enabled' is what the YAML asks for and 'active' what is actually on the
     interface: the gateway keeps them apart on purpose, for an external consumer,
     and figo is that consumer -- so they are carried separately and never merged
-    into one 'is it working' flag.
+    into one 'is it working' flag. 'drift' is a third question and not a
+    combination of the first two: it compares the configuration with the
+    installed iptables rules, which neither 'enabled' nor 'active' can see. It
+    is therefore carried as the gateway reports it and never deduced.
+
+    An absent 'drift' is carried as None, not as consistent: a gateway too old
+    to report it has not said the rules are right, and the difference between
+    'no drift' and 'nobody looked' is the whole value of the field.
+
+    'allow.icmp' is a list of type names or the string "all", which is how the
+    gateway renders 'icmp: true'. The two are kept in separate keys because a
+    string is iterable: list("all") is ['a', 'l', 'l'], three ICMP types that do
+    not exist, and nothing downstream would report it.
 
     Returns:
         tuple: (mappings, warnings).
@@ -1633,12 +1649,23 @@ def parse_floating_ip_list(stdout):
             warnings.append(f"Skipping a mapping with no public address: {entry!r}.")
             continue
         allow = entry.get('allow') or {}
+        icmp_value = allow.get('icmp')
+        icmp_all = icmp_value == 'all'
+        drift = entry.get('drift')
+        drift = {
+            'missing': drift.get('missing') or 0,
+            'extra': drift.get('extra') or 0,
+            'consistent': bool(drift.get('consistent')),
+        } if isinstance(drift, dict) else None
         mappings.append({
             'public': entry.get('public'),
             'private': entry.get('private'),
             'enabled': bool(entry.get('enabled')),
             'active': bool(entry.get('active')),
             'mode': entry.get('mode'),
+            'label': entry.get('label'),
+            'note': entry.get('note'),
+            'drift': drift,
             'tcp': [
                 (port.get('pub_port'), port.get('priv_port'))
                 for port in (allow.get('tcp') or [])
@@ -1647,7 +1674,8 @@ def parse_floating_ip_list(stdout):
                 (port.get('pub_port'), port.get('priv_port'))
                 for port in (allow.get('udp') or [])
             ],
-            'icmp': list(allow.get('icmp') or []),
+            'icmp': [] if icmp_all else list(icmp_value or []),
+            'icmp_all': icmp_all,
         })
 
     return mappings, warnings
@@ -7761,6 +7789,10 @@ def float_row_as_dict(row):
         'tcp': [{'pub_port': pub, 'priv_port': priv} for pub, priv in row.get('tcp') or []],
         'udp': [{'pub_port': pub, 'priv_port': priv} for pub, priv in row.get('udp') or []],
         'icmp': row.get('icmp') or [],
+        'icmp_all': bool(row.get('icmp_all')),
+        'label': row.get('label'),
+        'note': row.get('note'),
+        'drift': row.get('drift'),
         'instance': instance.get('name'),
         'project': instance.get('project'),
         'status': instance.get('status'),
@@ -7860,7 +7892,8 @@ def show_float_show(remote, public_ip, as_json=False, extend=False):
         ('mode', row.get('mode') or "-"),
         ('tcp', ports),
         ('udp', udp_ports),
-        ('icmp', ", ".join(row.get('icmp') or []) or "-"),
+        ('icmp', "all" if row.get('icmp_all')
+                 else (", ".join(row.get('icmp') or []) or "-")),
         ('invariant', row.get('invariant') or "-"),
     ]:
         add_row_to_output(COLS, [field, str(value)])
