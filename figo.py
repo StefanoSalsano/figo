@@ -8114,6 +8114,113 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
     return refusals, warnings
 
 
+def probe_listening_ports(scope):
+    """Read what is listening inside an instance. Read-only.
+
+    Returns:
+        list: (address, port) pairs, or None when the question could not be
+              asked -- which is not the same as 'nothing is listening' and is
+              reported as such.
+    """
+    argv = incus_exec_argv(scope, ['ss', '-H', '-ltn'])
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_listening_ports(result.stdout)
+
+
+def show_float_diagnose(remote, instance_reference, extend=False):
+    """Order the known causes of 'this floating IP does not work'. Read-only.
+
+    Nothing here is applied or written: it runs 'floating-ip list --json' on the
+    gateway, reads the default route and the listening sockets of the instance,
+    and compares all of it with what the configuration says.
+
+    The one thing it deliberately does not do is claim the mapping works. That
+    can only be seen from outside the university network (7.5), so the commands
+    to run there are printed instead.
+    """
+    _subnets, gateways, warnings = figo_network()
+    subnet, gateway, selection_warnings = select_gateway_for_remote(gateways, remote)
+    for warning in warnings + selection_warnings:
+        logger.warning(warning)
+
+    probe = probe_gateway(gateway['scope']) if gateway else None
+    mapping, invariant, invariant_detail, listeners, upstream = None, None, None, None, []
+
+    if gateway is not None and probe.outcome == GATEWAY_PROBE_OK:
+        records = collect_instance_records(remote)
+        instance, error = find_instance_by_reference(records, instance_reference)
+        if error:
+            logger.error(error)
+            return
+
+        addresses = address_in_subnet(
+            list(instance.get('addresses') or []) + list(instance.get('additional') or []),
+            subnet
+        )
+        mapping = next(
+            (m for m in probe.mappings if m.get('private') in addresses), None
+        )
+
+        if mapping is not None:
+            gateway_read = None
+            if instance['status'] == "Running":
+                gateway_read = probe_default_gateway(instance['scope'])
+                listeners = probe_listening_ports(instance['scope'])
+            invariant, invariant_detail = float_invariant_status(
+                dict(mapping, enabled=True), instance, gateway_read,
+                gateway.get('address')
+            )
+
+            policy, policy_warnings = parse_upstream_policy(load_figo_config())
+            for warning in policy_warnings:
+                logger.warning(warning)
+            public_ports = [public for public, _private in mapping.get('tcp') or []]
+            upstream = upstream_constraints(
+                policy, mapping['public'], 'tcp', public_ports)
+            if mapping.get('icmp') or mapping.get('icmp_all'):
+                upstream += upstream_constraints(policy, mapping['public'], 'icmp')
+
+    rows, problems = diagnose_rows(
+        gateway, probe.outcome if probe else GATEWAY_PROBE_ERROR, mapping,
+        invariant, invariant_detail, listeners, upstream
+    )
+
+    COLS = [('CHECK', 12), ('SUBJECT', 46), ('VERDICT', 22)]
+    add_header_line_to_output(COLS)
+    for check, subject, verdict, is_problem in rows:
+        add_row_to_output(COLS, [check, subject, verdict + ("   <--" if is_problem else "")])
+    flush_output(extend=extend)
+
+    print()
+    if problems:
+        print(f"{len(problems)} problem(s) found:")
+        for check, subject, verdict, _ in problems:
+            print(f"  - {check}: {subject} is '{verdict}'")
+    else:
+        print("Nothing figo can check is wrong.")
+
+    if invariant_detail and invariant != FLOAT_INVARIANT_OK:
+        print(f"  {invariant_detail}")
+    if listeners is None and mapping is not None:
+        print("  The listening sockets could not be read: the instance may be stopped.")
+
+    print()
+    print("Not checked: reachability from outside the university network.")
+    print("figo cannot test it -- every machine in the testbed is on the inside.")
+    if mapping is not None:
+        commands = external_check_commands(
+            mapping['public'], [public for public, _p in mapping.get('tcp') or []])
+        if commands:
+            print("From a machine outside the university network:")
+            for command in commands:
+                print(f"    {command}")
+
+
 def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=False,
                         text=None, clear=False, instance_reference=None,
                         add_options=None, requested=None):
@@ -8318,6 +8425,152 @@ def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=
         f"enabled={new_row['enabled']}, active={new_row['active']}, "
         f"rules {format_rule_drift(new_row.get('drift'))}."
     )
+
+
+LISTENER_OPEN = 'listening'
+LISTENER_LOOPBACK = 'loopback only'
+LISTENER_CLOSED = 'not listening'
+
+
+def parse_listening_ports(stdout):
+    """Read the output of 'ss -H -ltn' into (address, port) pairs. Pure function.
+
+    Only the local side matters. The address is kept rather than discarded
+    because binding to 127.0.0.1 and binding to every interface are opposite
+    answers to 'is this port served': a floating IP is DNAT'd to the private
+    address of the instance, and a process listening only on loopback will
+    refuse the connection while looking perfectly alive from inside.
+    """
+    listeners = []
+    for line in (stdout or '').splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local = fields[3]
+        address, _, port = local.rpartition(':')
+        try:
+            listeners.append((address.strip('[]') or '*', int(port)))
+        except ValueError:
+            continue
+    return listeners
+
+
+def listener_verdict(listeners, port):
+    """What is serving a port inside the instance, for one port. Pure function.
+
+    Returns one of LISTENER_OPEN, LISTENER_LOOPBACK, LISTENER_CLOSED -- three
+    answers rather than a boolean, because the middle one is a real and common
+    failure with its own remedy, and calling it 'listening' would send the
+    reader to look at the firewall instead.
+    """
+    matching = [address for address, number in listeners or [] if number == port]
+    if not matching:
+        return LISTENER_CLOSED
+    for address in matching:
+        if address in ('*', '0.0.0.0', '::') or not address.startswith('127.'):
+            if address != '::1':
+                return LISTENER_OPEN
+    return LISTENER_LOOPBACK
+
+
+def external_check_commands(public_ip, ports):
+    """The commands to run from outside, since figo cannot. Pure function.
+
+    Section 7.5: no machine in the testbed can test its own floating IP from
+    outside -- they are all inside the university network, and a test from any
+    of them proves nothing about what an external client sees. So figo hands
+    the commands over instead of pretending.
+    """
+    commands = []
+    for port in ports or []:
+        if port in (80, 443):
+            scheme = 'https' if port == 443 else 'http'
+            commands.append(
+                f"curl -sS -o /dev/null -w '%{{http_code}}\\n' --max-time 5 "
+                f"{scheme}://{public_ip}/"
+            )
+        else:
+            commands.append(f"nc -vz -w 5 {public_ip} {port}")
+    return commands
+
+
+def diagnose_rows(gateway, probe_outcome, mapping, invariant, invariant_detail,
+                  listeners, upstream):
+    """Order the known causes of 'the floating IP does not work'. Pure function.
+
+    The order is the whole point, and it is by cost and frequency rather than
+    by layer: the gateway answering at all, then the mapping being there and
+    on, then the default route -- the most frequent fault in this deployment --
+    then the rules, then what is actually listening, and last what somebody
+    said about the network outside.
+
+    Each row carries its own verdict and whether it is a problem, so the caller
+    prints and counts rather than deciding again.
+
+    Returns:
+        tuple: (rows, problems). Each row is (check, subject, verdict, problem).
+    """
+    rows = []
+
+    if gateway is None:
+        rows.append(('gateway', 'none configured for this subnet', 'MISSING', True))
+        return rows, [r for r in rows if r[3]]
+
+    rows.append((
+        'gateway', f"{gateway['scope']} ({gateway.get('address')})",
+        probe_outcome.upper(), probe_outcome != GATEWAY_PROBE_OK,
+    ))
+    if probe_outcome != GATEWAY_PROBE_OK:
+        return rows, [r for r in rows if r[3]]
+
+    if mapping is None:
+        rows.append(('mapping', 'no floating IP maps this instance', 'MISSING', True))
+        return rows, [r for r in rows if r[3]]
+
+    state = ('enabled' if mapping['enabled'] else 'disabled') + \
+            (' + active' if mapping['active'] else ' + not active')
+    rows.append((
+        'mapping', f"{mapping['public']} -> {mapping['private']}", state,
+        not (mapping['enabled'] and mapping['active']),
+    ))
+
+    rows.append((
+        'invariant', 'default route of the instance',
+        {FLOAT_INVARIANT_OK: 'OK', FLOAT_INVARIANT_VIOLATED: 'WRONG'}.get(
+            invariant, 'unknown'),
+        invariant == FLOAT_INVARIANT_VIOLATED,
+    ))
+
+    drift = mapping.get('drift')
+    rows.append((
+        'rules', 'configuration against installed rules',
+        'not reported' if drift is None
+        else ('consistent' if drift['consistent']
+              else f"{drift['missing']} missing, {drift['extra']} extra"),
+        bool(drift and not drift['consistent']),
+    ))
+
+    for public_port, private_port in mapping.get('tcp') or []:
+        verdict = listener_verdict(listeners, private_port) if listeners is not None \
+            else 'not read'
+        rows.append((
+            'listener', f"tcp/{private_port} inside the instance", verdict,
+            verdict in (LISTENER_CLOSED, LISTENER_LOOPBACK),
+        ))
+
+    if upstream:
+        for entry, ports in upstream:
+            what = entry['protocol'] + ("/" + ",".join(str(p) for p in ports) if ports else "")
+            rows.append((
+                'upstream',
+                f"{what} towards {entry['public_ip'] or entry['public_range']}",
+                f"reported {entry['effect']} ({entry['confidence']}, {entry['date']})",
+                False,
+            ))
+    else:
+        rows.append(('upstream', 'the ports of this mapping', 'no known constraint', False))
+
+    return rows, [r for r in rows if r[3]]
 
 
 def build_float_rows(mappings, address_index):
@@ -8932,6 +9185,32 @@ def create_net_parser(subparsers):
             help="Print the command figo would run in the gateway, and change nothing"
         )
 
+    float_diagnose_parser = float_subparsers.add_parser(
+        "diagnose",
+        help="Order the known causes when a floating IP does not work.",
+        description="Check, cheapest and most frequent first: the gateway answers, the\n"
+                    "mapping is there and on, the instance routes back through the\n"
+                    "gateway, the installed rules match the configuration, something is\n"
+                    "listening inside, and what is recorded about the network outside.\n"
+                    "Read-only. Reachability from outside is NOT checked: no machine in\n"
+                    "the testbed can see its own floating IP from there, so the commands\n"
+                    "to run from outside are printed instead.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  figo net float diagnose g-alci\n"
+               "  figo net float diagnose figo-g-alci.g-alci"
+    )
+    float_diagnose_parser.add_argument(
+        "instance", help="Instance to diagnose: 'name' or 'project.name'"
+    )
+    float_diagnose_parser.add_argument(
+        "-r", "--remote", default="blade3",
+        help="Remote the instance lives on. Defaults to 'blade3'."
+    )
+    float_diagnose_parser.add_argument(
+        "-e", "--extend", action="store_true", help="Extend column width to fit the content"
+    )
+
     float_add_parser = float_subparsers.add_parser(
         "add",
         help="Create a mapping towards an instance, and apply.",
@@ -9188,6 +9467,9 @@ def handle_net_command(args, parser_dict):
                                 args.public_ip,
                                 note=getattr(args, 'note', None),
                                 dry_run=args.dry_run)
+        elif args.float_command == "diagnose":
+            show_float_diagnose(fix_remote_name(args.remote), args.instance,
+                                extend=args.extend)
         elif args.float_command == "add":
             write_float_mapping(
                 fix_remote_name(args.remote), "add", args.public_ip,
