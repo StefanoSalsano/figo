@@ -124,3 +124,101 @@ def test_a_satisfied_invariant_is_silent(figo):
         "enable", "160.80.105.43", row(), figo.FLOAT_INVARIANT_OK, "all good"
     )
     assert (refusals, warnings) == ([], [])
+
+
+# --- The port verbs ---------------------------------------------------------
+
+def test_the_options_reach_the_container_as_separate_arguments(figo):
+    argv = figo.floating_ip_write_argv(
+        "blade3:default.gw-float", "open", "160.80.105.36",
+        options=["--tcp", "8080,8443:443"]
+    )
+    assert argv[-5:] == [
+        "floating-ip", "open", "160.80.105.36", "--tcp", "8080,8443:443",
+    ]
+
+
+def test_the_protocol_options_keep_a_stable_order(figo):
+    assert figo.float_port_options("80,443", None, "echo-request") == [
+        "--tcp", "80,443", "--icmp", "echo-request"
+    ]
+
+
+def test_no_protocol_at_all_is_no_options(figo):
+    """The dispatcher turns this into a refusal: a verb with nothing to change."""
+    assert figo.float_port_options(None, None, None) == []
+
+
+def test_opening_a_port_on_a_serving_mapping_is_gated(figo):
+    """More traffic through a mapping whose return path is wrong is more traffic
+    that does not arrive."""
+    refusals, _ = figo.float_write_decision(
+        "open", "160.80.105.36", row(enabled=True, active=True),
+        figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
+    )
+    assert len(refusals) == 1
+
+
+def test_opening_a_port_on_a_mapping_that_is_off_is_not_gated(figo):
+    """Nothing is served yet, so nothing can be served wrongly: the check belongs
+    to the moment the mapping is turned on, and that moment has its own verb."""
+    refusals, warnings = figo.float_write_decision(
+        "open", "160.80.105.36", row(enabled=False, active=False),
+        figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
+    )
+    assert (refusals, warnings) == ([], [])
+
+
+def test_closing_a_port_is_never_gated(figo):
+    refusals, _ = figo.float_write_decision(
+        "close", "160.80.105.36", row(enabled=True, active=True),
+        figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
+    )
+    assert refusals == []
+
+
+def test_replace_is_gated_like_open(figo):
+    refusals, _ = figo.float_write_decision(
+        "replace", "160.80.105.36", row(enabled=True, active=True),
+        figo.FLOAT_INVARIANT_VIOLATED, "'x' routes by default via 10.202.9.129."
+    )
+    assert len(refusals) == 1
+
+
+# --- What figo can tell is a no-op, and what it deliberately cannot ----------
+
+def test_enable_on_an_enabled_mapping_changes_nothing(figo):
+    assert figo.float_write_is_noop("enable", row(enabled=True)) is True
+    assert figo.float_write_is_noop("disable", row(enabled=False)) is True
+
+
+def test_a_note_is_always_a_change(figo):
+    assert figo.float_write_is_noop("disable", row(enabled=False), note="why") is False
+
+
+def test_a_port_verb_is_never_declared_a_noop_here(figo):
+    """Deciding it would mean re-implementing the gateway's port semantics in a
+    second place; the gateway says 'nothing changed' itself when that is true."""
+    assert figo.float_write_is_noop("open", row(enabled=True)) is False
+
+
+# --- Reporting what a mapping allows, after the write -----------------------
+
+def test_a_remapped_port_is_rendered_as_such(figo):
+    assert figo.format_allow(
+        {"mode": "whitelist", "tcp": [(80, 80), (8443, 443)], "udp": [], "icmp": []}
+    ) == "tcp 80, 8443:443"
+
+
+def test_icmp_all_is_not_printed_as_an_empty_list(figo):
+    assert figo.format_allow(
+        {"mode": "whitelist", "tcp": [], "udp": [], "icmp": [], "icmp_all": True}
+    ) == "icmp all"
+
+
+def test_a_mapping_with_no_allow_says_everything(figo):
+    """'open mode' and 'a whitelist that happens to be empty' are opposites, and
+    the report must not print them the same way."""
+    assert figo.format_allow({"mode": "open"}) == "everything (no allow)"
+    assert figo.format_allow(
+        {"mode": "whitelist", "tcp": [], "udp": [], "icmp": []}) == "nothing"

@@ -7609,19 +7609,79 @@ def select_gateway_for_remote(gateways, remote):
     return subnet, gateway, warnings
 
 
-def floating_ip_write_argv(scope, verb, public_ip, note=None):
+def floating_ip_write_argv(scope, verb, public_ip, note=None, options=()):
     """Build the argv that runs one write verb of the gateway tool in its container.
 
     Pure function. '--note' goes with 'disable' only: the gateway accepts it
     nowhere else, and a mapping turned off with nobody recording why is the
     case that field exists for.
     """
-    command = ['floating-ip', verb, public_ip]
+    command = ['floating-ip', verb, public_ip] + list(options)
     if note is not None:
         if verb != 'disable':
             raise ValueError(f"'{verb}' does not take a note")
         command += ['--note', note]
     return incus_exec_argv(scope, command)
+
+
+# The verbs that can start serving traffic. They are gated on the invariant;
+# 'disable' and 'close', which can only stop traffic, never are -- refusing to
+# stop a broken mapping would withhold the remedy from whoever is applying it.
+FLOAT_VERBS_THAT_SERVE = ('enable', 'open', 'replace')
+
+
+def float_port_options(tcp=None, udp=None, icmp=None):
+    """Build the protocol options of a port verb, in a stable order.
+
+    Pure function. The values are passed to the gateway as they were typed:
+    what a port list may contain, and what '--icmp all' means, is the gateway's
+    semantics, and a second parser here would be a second thing to keep in
+    step with it.
+    """
+    options = []
+    for flag, value in (('--tcp', tcp), ('--udp', udp), ('--icmp', icmp)):
+        if value:
+            options += [flag, value]
+    return options
+
+
+def float_write_is_noop(verb, row, note=None):
+    """True when figo can already tell the write would change nothing.
+
+    Pure function, and deliberately narrow: 'enable' and 'disable' are one
+    boolean figo has in hand, so it can skip the verb and the apply. What
+    'open' or 'replace' would change is a list the gateway renders in its own
+    style, and deciding here whether that is a no-op would mean re-implementing
+    its semantics in a second place. A note is always a change: it is written
+    even when the state already matches.
+    """
+    if note is not None:
+        return False
+    if verb == 'enable':
+        return bool(row.get('enabled'))
+    if verb == 'disable':
+        return not row.get('enabled')
+    return False
+
+
+def format_allow(mapping):
+    """Render what a mapping allows, in one line, for the report after a write."""
+    if mapping.get('mode') == 'open':
+        return "everything (no allow)"
+
+    parts = []
+    for protocol in ('tcp', 'udp'):
+        ports = mapping.get(protocol) or []
+        if ports:
+            parts.append(f"{protocol} " + ", ".join(
+                str(pub) if pub == priv else f"{pub}:{priv}" for pub, priv in ports
+            ))
+    if mapping.get('icmp_all'):
+        parts.append("icmp all")
+    elif mapping.get('icmp'):
+        parts.append("icmp " + ", ".join(mapping['icmp']))
+
+    return "; ".join(parts) or "nothing"
 
 
 def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=None):
@@ -7653,14 +7713,19 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
         )
         return refusals, warnings
 
-    if verb != 'enable':
+    # Opening a port on a mapping that is off starts nothing, so it is not
+    # gated: the check belongs to the moment the mapping is turned on.
+    serves_now = verb == 'enable' or (
+        verb in FLOAT_VERBS_THAT_SERVE and bool(row.get('enabled'))
+    )
+    if not serves_now:
         return refusals, warnings
 
     if invariant == FLOAT_INVARIANT_VIOLATED:
         refusals.append(
-            f"{invariant_detail} Turning {public_ip} on would produce a mapping "
-            f"that looks right and does not work. Fix the default route of the "
-            f"instance first, or leave the mapping off."
+            f"{invariant_detail} Serving more traffic through {public_ip} would "
+            f"produce a mapping that looks right and does not work. Fix the "
+            f"default route of the instance first, or leave the mapping off."
         )
     elif invariant in (FLOAT_INVARIANT_UNKNOWN, FLOAT_INVARIANT_NOT_CHECKED):
         warnings.append(
@@ -7672,16 +7737,19 @@ def float_write_decision(verb, public_ip, row, invariant=None, invariant_detail=
     return refusals, warnings
 
 
-def set_float_enabled(remote, public_ip, enable, note=None, dry_run=False):
-    """Turn a mapping on or off through the gateway, then apply and re-read.
+def write_float_mapping(remote, verb, public_ip, options=(), note=None, dry_run=False):
+    """Run one write verb of the gateway on a mapping, then apply and re-read.
 
-    The only write path in figo that touches a gateway, and it reports what it
+    The single write path of figo towards a gateway. It reports what it
     measured afterwards rather than what it asked for: the gateway is the
     authority on its own state.
-    """
-    verb = 'enable' if enable else 'disable'
-    state = 'enabled' if enable else 'disabled'
 
+    What the verbs mean is not re-implemented here. The gateway refuses 'open'
+    on a mapping with no 'allow' -- adding the first port would close every
+    other one -- and says so, pointing at 'replace'; figo carries that refusal
+    to the operator instead of holding a second copy of the rule that could
+    drift from it.
+    """
     _subnets, gateways, warnings = figo_network()
     _subnet, gateway, selection_warnings = select_gateway_for_remote(gateways, remote)
     for warning in warnings + selection_warnings:
@@ -7705,7 +7773,7 @@ def set_float_enabled(remote, public_ip, enable, note=None, dry_run=False):
     # enabled is off, and the read path skips the route of a mapping that is
     # neither enabled nor active -- exactly the state this command starts from.
     invariant, invariant_detail = None, None
-    if row is not None and enable:
+    if row is not None and verb in FLOAT_VERBS_THAT_SERVE:
         instance = row.get('instance')
         gateway_read = None
         if instance and instance['status'] == "Running":
@@ -7724,13 +7792,14 @@ def set_float_enabled(remote, public_ip, enable, note=None, dry_run=False):
             logger.error(refusal)
         return
 
-    if row.get('enabled') == enable and note is None:
+    if float_write_is_noop(verb, row, note):
+        state = 'enabled' if verb == 'enable' else 'disabled'
         logger.info(
             f"{public_ip} is already {state}: nothing to do, and nothing applied."
         )
         return
 
-    argv = floating_ip_write_argv(gateway['scope'], verb, public_ip, note)
+    argv = floating_ip_write_argv(gateway['scope'], verb, public_ip, note, options)
     apply_argv = incus_exec_argv(gateway['scope'], ['floating-ip', 'apply'])
 
     if dry_run:
@@ -7776,7 +7845,8 @@ def set_float_enabled(remote, public_ip, enable, note=None, dry_run=False):
         return
 
     logger.info(
-        f"{public_ip} is now enabled={new_row['enabled']}, active={new_row['active']}, "
+        f"{public_ip} now allows {format_allow(new_row)} -- "
+        f"enabled={new_row['enabled']}, active={new_row['active']}, "
         f"rules {format_rule_drift(new_row.get('drift'))}."
     )
 
@@ -8315,6 +8385,52 @@ def create_net_parser(subparsers):
         help="Print the commands figo would run in the gateway, and change nothing"
     )
 
+    for verb, summary, detail in (
+        ("open", "Add ports to an existing mapping, and apply.",
+         "Add ports or ICMP types to what a mapping already allows, then\n"
+         "reinstall its rules. The gateway refuses to open the first port of a\n"
+         "mapping that has no 'allow': that would create a whitelist and close\n"
+         "everything else, and it points at 'replace' instead."),
+        ("close", "Remove ports from an existing mapping, and apply.",
+         "Remove ports or ICMP types from what a mapping allows, then reinstall\n"
+         "its rules. Never refused on the default-gateway invariant: closing a\n"
+         "port only takes traffic away."),
+        ("replace", "Set the whole port list of a mapping, and apply.",
+         "Replace what a mapping allows with exactly what is given, then\n"
+         "reinstall its rules. This is the verb that may create a whitelist on a\n"
+         "mapping that had none, which is why 'open' refuses to."),
+    ):
+        port_parser = float_subparsers.add_parser(
+            verb,
+            help=summary,
+            description=detail + "\n"
+                        "At least one of --tcp, --udp or --icmp is required.",
+            formatter_class=argparse.RawTextHelpFormatter,
+            epilog="Examples:\n"
+                   f"  figo net float {verb} 160.80.105.36 --tcp 8080,8443:443\n"
+                   f"  figo net float {verb} 160.80.105.36 --icmp echo-request --dry-run"
+        )
+        port_parser.add_argument("public_ip", help="The public address of the mapping")
+        port_parser.add_argument(
+            "--tcp", default=None,
+            help="Comma-separated TCP ports, '8080' or '8443:443' to remap"
+        )
+        port_parser.add_argument(
+            "--udp", default=None, help="Comma-separated UDP ports"
+        )
+        port_parser.add_argument(
+            "--icmp", default=None,
+            help="ICMP type names, or 'all'; 'none' is accepted by replace only"
+        )
+        port_parser.add_argument(
+            "-r", "--remote", default="blade3",
+            help="Remote whose gateway holds the mapping. Defaults to 'blade3'."
+        )
+        port_parser.add_argument(
+            "--dry-run", action="store_true", dest="dry_run",
+            help="Print the commands figo would run in the gateway, and change nothing"
+        )
+
     return net_parser
 
 
@@ -8505,12 +8621,23 @@ def handle_net_command(args, parser_dict):
         elif args.float_command in ["show", "s"]:
             show_float_show(fix_remote_name(args.remote), args.public_ip,
                             as_json=args.as_json, extend=args.extend)
-        elif args.float_command == "enable":
-            set_float_enabled(fix_remote_name(args.remote), args.public_ip, True,
-                              dry_run=args.dry_run)
-        elif args.float_command == "disable":
-            set_float_enabled(fix_remote_name(args.remote), args.public_ip, False,
-                              note=args.note, dry_run=args.dry_run)
+        elif args.float_command in ["enable", "disable"]:
+            write_float_mapping(fix_remote_name(args.remote), args.float_command,
+                                args.public_ip,
+                                note=getattr(args, 'note', None),
+                                dry_run=args.dry_run)
+        elif args.float_command in ["open", "close", "replace"]:
+            options = float_port_options(args.tcp, args.udp, args.icmp)
+            if not options:
+                logger.error(
+                    f"'{args.float_command}' needs at least one of --tcp, --udp or "
+                    f"--icmp: with none of them it would ask the gateway to change "
+                    f"nothing."
+                )
+            else:
+                write_float_mapping(fix_remote_name(args.remote), args.float_command,
+                                    args.public_ip, options=options,
+                                    dry_run=args.dry_run)
 
 
 def handle_gpu_command(args, parser_dict):
