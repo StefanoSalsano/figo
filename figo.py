@@ -5285,6 +5285,305 @@ def generate_ssh_key_pair(username, private_key_file, email=None):
         logger.error(f"Failed to generate SSH key pair for user '{username}': {e}")
         return False
 
+#############################################
+###### VPN audit (network model 4.2) ########
+#############################################
+
+# The order in which findings are reported, most consequential first. A kind
+# missing from this tuple would sort last and be easy to overlook, so the
+# formatter refuses to render one it does not know.
+VPN_AUDIT_ORDER = (
+    "duplicate-address",
+    "address-mismatch",
+    "no-peer",
+    "peer-disabled",
+    "orphan-peer-enabled",
+    "allowed-address-wide",
+    "allowed-address-extra",
+    "orphan-peer-disabled",
+    "allocator-blind",
+    "comment-mismatch",
+)
+
+# RouterOS `print terse` writes `key=value` pairs whose values may contain
+# spaces, so fields are found by their key and each value runs to the next key.
+MIKROTIK_TERSE_FIELD = re.compile(r"(?:^|\s)([a-z][a-z0-9-]*)=")
+
+
+def parse_wireguard_client_conf(text):
+    """Read, from a client .conf, the two facts an audit needs.
+
+    The file is figo's record of a VPN user: the address it allocated, and the
+    public key of the server the client was told to talk to. The server key is
+    what lets the audit find the right WireGuard interface on the access router
+    by measurement instead of by a constant: a peer list is comparable with
+    USER_DIR only if it comes from the interface these clients are configured
+    for, and the router may carry several (the testbed MikroTik carries two).
+
+    `PublicKey` is read only inside `[Peer]`; the client's own key never appears
+    in this file (it holds `PrivateKey`), and the .wgpub file beside it carries
+    the public one.
+
+    Parameters:
+        text (str): the content of the .conf file.
+
+    Returns:
+        dict: 'address' (str or None, without prefix), 'prefixlen' (int or
+            None) and 'server_public_key' (str or None).
+    """
+    address = None
+    prefixlen = None
+    server_public_key = None
+    section = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if section == "interface" and key == "address":
+            address, _, prefix = value.partition("/")
+            address = address.strip() or None
+            if prefix.strip().isdigit():
+                prefixlen = int(prefix.strip())
+        elif section == "peer" and key == "publickey":
+            server_public_key = value or None
+
+    return {"address": address, "prefixlen": prefixlen,
+            "server_public_key": server_public_key}
+
+
+def parse_mikrotik_terse(text):
+    """Turn RouterOS `print terse` output into one dictionary per row.
+
+    A row looks like
+
+        7 X comment=Taloma-Uniroma1 interface=wireguard2 public-key=... 
+
+    so it cannot be split on whitespace: `comment=Stefano GPUNet` is a single
+    value. Each value runs from its `=` to the start of the next `key=`.
+
+    The leading tokens before the first field are the row number and the flag
+    letters RouterOS prints for it; `X` is disabled, and that one matters --
+    a peer that exists and is disabled is neither present nor absent.
+
+    Lines carrying no `key=` at all (the flag legend, blank lines) are skipped
+    rather than parsed into empty rows.
+
+    Parameters:
+        text (str): the raw output of a `print terse` command.
+
+    Returns:
+        list: one dict per row, with 'index' and 'flags' plus every field.
+    """
+    rows = []
+    for raw in text.splitlines():
+        line = raw.replace("\r", "").rstrip()
+        matches = list(MIKROTIK_TERSE_FIELD.finditer(line))
+        if not matches:
+            continue
+        head = line[:matches[0].start()].split()
+        row = {"index": head[0] if head else None,
+               "flags": "".join(head[1:])}
+        for position, match in enumerate(matches):
+            end = matches[position + 1].start() if position + 1 < len(matches) else len(line)
+            value = line[match.end():end].strip()
+            if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                value = value[1:-1]
+            row[match.group(1)] = value
+        rows.append(row)
+    return rows
+
+
+def wireguard_interface_for_server_key(interfaces, server_public_key):
+    """Name the interface whose public key is the one the clients were given.
+
+    Returns None both when nothing matches and when more than one does: either
+    way the audit has no single interface it can honestly compare against, and
+    guessing one would produce a confident report about the wrong peers.
+
+    Parameters:
+        interfaces (list): rows from `/interface wireguard print terse`.
+        server_public_key (str): the key read from the client .conf files.
+
+    Returns:
+        str or None: the interface name.
+    """
+    if not server_public_key:
+        return None
+    names = [row.get("name") for row in interfaces
+             if row.get("public-key") == server_public_key and row.get("name")]
+    return names[0] if len(names) == 1 else None
+
+
+def parse_allowed_addresses(value):
+    """Split a peer's `allowed-address` into (address, prefix length) pairs.
+
+    RouterOS separates several entries with commas. An entry figo cannot read
+    is returned with a prefix length of None rather than dropped, so that a
+    malformed value is reported instead of silently reducing the peer's
+    apparent reach.
+
+    Parameters:
+        value (str): the field as the router prints it.
+
+    Returns:
+        list: (str, int or None) pairs, in the order given.
+    """
+    entries = []
+    for chunk in (value or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        address, _, prefix = chunk.partition("/")
+        entries.append((address.strip(), int(prefix) if prefix.strip().isdigit() else None))
+    return entries
+
+
+def vpn_client_subnet(users):
+    """The one subnet the client configurations agree on, or None.
+
+    Taken from the `Address = x/len` lines rather than from a constant, for the
+    same reason as the interface: it is a fact about this installation, and if
+    the .conf files disagree the audit must not pick one of them.
+    """
+    networks = set()
+    for record in users.values():
+        if record.get("address") and record.get("prefixlen") is not None:
+            networks.add(ipaddress.ip_network(
+                f"{record['address']}/{record['prefixlen']}", strict=False))
+    return networks.pop() if len(networks) == 1 else None
+
+
+def vpn_audit_findings(users, peers, base_address=None):
+    """Compare the two registries and return what does not line up.
+
+    `users` is figo's record (Section 2.1): what it believes it allocated.
+    `peers` is what the access router enforces, already restricted to the
+    interface these clients talk to. Nothing here reads a file or a socket.
+
+    The join is on the **public key**, not on the comment: the comment is a
+    label a human can retype, while the key is what WireGuard actually uses to
+    recognise a peer. Joining on the comment would make "same name, different
+    key" invisible, which is precisely a peer someone rebuilt by hand.
+
+    Parameters:
+        users (dict): name -> {'address', 'prefixlen', 'public_key', ...}.
+        peers (list): parsed terse rows for one interface.
+        base_address (str, optional): the first address figo's allocator hands
+            out. Only used to say which router-only addresses sit in the range
+            the allocator will walk into.
+
+    Returns:
+        list: findings, each {'kind', 'subject', 'detail'}, most consequential
+            first.
+    """
+    findings = []
+    subnet = vpn_client_subnet(users)
+
+    peers_by_key = {}
+    for peer in peers:
+        peers_by_key.setdefault(peer.get("public-key"), []).append(peer)
+
+    # Every address claimed on the router, with who claims it. Disabled peers
+    # are counted: a duplicate that is only dormant becomes live the moment
+    # somebody re-enables the peer, and that is a one-click operation.
+    claims = {}
+    for peer in peers:
+        label = peer.get("comment") or peer.get("public-key") or "?"
+        for address, _prefix in parse_allowed_addresses(peer.get("allowed-address", "")):
+            claims.setdefault(address, []).append(
+                label + (" (disabled)" if "X" in (peer.get("flags") or "") else ""))
+
+    for address in sorted(claims, key=_vpn_sort_key):
+        if len(claims[address]) > 1:
+            findings.append({"kind": "duplicate-address", "subject": address,
+                             "detail": ", ".join(sorted(claims[address]))})
+
+    matched_keys = set()
+    for name in sorted(users):
+        record = users[name]
+        key = record.get("public_key")
+        candidates = peers_by_key.get(key, []) if key else []
+        if not candidates:
+            findings.append({"kind": "no-peer", "subject": name,
+                             "detail": f"{record.get('address')} allocated, no peer with this key"})
+            continue
+        matched_keys.add(key)
+        for peer in candidates:
+            if "X" in (peer.get("flags") or ""):
+                findings.append({"kind": "peer-disabled", "subject": name,
+                                 "detail": "the peer exists but is disabled"})
+            entries = parse_allowed_addresses(peer.get("allowed-address", ""))
+            for address, prefix in entries:
+                if prefix != 32:
+                    findings.append({"kind": "allowed-address-wide", "subject": name,
+                                     "detail": f"{address}/{prefix} is not a /32"})
+            addresses = [address for address, _ in entries]
+            if record.get("address") and record["address"] not in addresses:
+                findings.append({"kind": "address-mismatch", "subject": name,
+                                 "detail": f"conf says {record['address']}, router enforces "
+                                           f"{', '.join(addresses) or 'nothing'}"})
+            # Only claimed when the client files agree on one subnet: without
+            # that, "outside the subnet" is a statement figo cannot support,
+            # and it would fire on every address of every user.
+            if subnet is not None:
+                for address, _ in entries:
+                    if ipaddress.ip_address(address) in subnet:
+                        continue
+                    findings.append({"kind": "allowed-address-extra", "subject": name,
+                                     "detail": f"{address} is allowed and is outside {subnet}"})
+            comment = peer.get("comment")
+            if comment and comment != name:
+                findings.append({"kind": "comment-mismatch", "subject": name,
+                                 "detail": f"the peer is labelled {comment}"})
+
+    known_addresses = {record.get("address") for record in users.values()}
+    blind = []
+    for peer in peers:
+        if peer.get("public-key") in matched_keys:
+            continue
+        label = peer.get("comment") or peer.get("public-key") or "?"
+        disabled = "X" in (peer.get("flags") or "")
+        findings.append({
+            "kind": "orphan-peer-disabled" if disabled else "orphan-peer-enabled",
+            "subject": label,
+            "detail": f"{peer.get('allowed-address') or 'no address'}, no .conf with this key"})
+        for address, _ in parse_allowed_addresses(peer.get("allowed-address", "")):
+            if address in known_addresses:
+                continue
+            # Without a subnet there is no range to reason about: the allocator
+            # walks the one the .conf files declare, and if they declare none
+            # (or disagree) the honest answer is to say nothing about tomorrow.
+            if subnet is None or ipaddress.ip_address(address) not in subnet:
+                continue
+            if base_address and ipaddress.ip_address(address) < ipaddress.ip_address(base_address):
+                continue
+            blind.append(address)
+
+    if blind:
+        findings.append({"kind": "allocator-blind", "subject": "next allocations",
+                         "detail": "on the router and in no .conf: "
+                                   + ", ".join(sorted(set(blind), key=_vpn_sort_key))})
+
+    return sorted(findings, key=lambda item: (VPN_AUDIT_ORDER.index(item["kind"]),
+                                              _vpn_sort_key(item["subject"])))
+
+
+def _vpn_sort_key(value):
+    """Sort addresses numerically and anything else as text, in one list."""
+    try:
+        return (0, int(ipaddress.ip_address(value)), "")
+    except ValueError:
+        return (1, 0, str(value))
+
 def add_wireguard_vpn_user_on_mikrotik(public_key, ip_address, vpnuser, username=SSH_MIKROTIK_USER_NAME, 
                                  host=SSH_MIKROTIK_HOST, port=SSH_MIKROTIK_PORT, interface=WG_INTERFACE, 
                                  keepalive=WG_VPN_KEEPALIVE):
