@@ -5294,6 +5294,7 @@ def generate_ssh_key_pair(username, private_key_file, email=None):
 # formatter refuses to render one it does not know.
 VPN_AUDIT_ORDER = (
     "duplicate-address",
+    "no-public-key",
     "address-mismatch",
     "no-peer",
     "peer-disabled",
@@ -5511,7 +5512,13 @@ def vpn_audit_findings(users, peers, base_address=None):
     for name in sorted(users):
         record = users[name]
         key = record.get("public_key")
-        candidates = peers_by_key.get(key, []) if key else []
+        if not key:
+            # Without the .wgpub there is no join key, and reporting this user
+            # as having no peer would be a verdict the audit cannot support.
+            findings.append({"kind": "no-public-key", "subject": name,
+                             "detail": "no .wgpub beside the .conf, so no peer can be matched"})
+            continue
+        candidates = peers_by_key.get(key, [])
         if not candidates:
             findings.append({"kind": "no-peer", "subject": name,
                              "detail": f"{record.get('address')} allocated, no peer with this key"})
@@ -5583,6 +5590,181 @@ def _vpn_sort_key(value):
         return (0, int(ipaddress.ip_address(value)), "")
     except ValueError:
         return (1, 0, str(value))
+
+def vpn_server_key(users):
+    """The one server public key the client files agree on, or None.
+
+    Two clients configured for different servers cannot be audited together:
+    their peers live on different interfaces, possibly on different routers,
+    and a single comparison would mix them. None says so instead of picking.
+    """
+    keys = {record.get("server_public_key") for record in users.values()
+            if record.get("server_public_key")}
+    return keys.pop() if len(keys) == 1 else None
+
+
+def format_vpn_audit(findings, interface=None, user_count=0, peer_count=0):
+    """Render the audit as text. Pure: facts in, lines out.
+
+    The first line says what was compared -- which interface, how many records
+    on each side -- because a report with nothing to say and a report about the
+    wrong interface look identical without it.
+    """
+    lines = [f"interface {interface or '?'}: "
+             f"{user_count} user record{'' if user_count == 1 else 's'}, "
+             f"{peer_count} peer{'' if peer_count == 1 else 's'}"]
+
+    if not findings:
+        lines.append("the two registries agree.")
+        return lines
+
+    counts = collections.Counter(item["kind"] for item in findings)
+    lines.append(", ".join(f"{counts[kind]} {kind}"
+                           for kind in VPN_AUDIT_ORDER if counts[kind]))
+    lines.append("")
+
+    width_kind = max(len(item["kind"]) for item in findings)
+    width_subject = max(len(str(item["subject"])) for item in findings)
+    for item in findings:
+        lines.append(f"{item['kind']:<{width_kind}}  "
+                     f"{str(item['subject']):<{width_subject}}  {item['detail']}")
+    return lines
+
+
+def load_vpn_user_records(directory=None):
+    """Read figo's own registry: one record per .conf in USER_DIR.
+
+    The public key comes from the .wgpub file written beside the .conf, not
+    derived from the private key: deriving it would mean handling the private
+    key of every user to answer a read-only question.
+
+    Returns:
+        tuple: (records by user name, list of problems worth telling the operator)
+    """
+    directory = os.path.expanduser(USER_DIR if directory is None else directory)
+    users = {}
+    problems = []
+
+    for path in sorted(glob.glob(os.path.join(directory, "*.conf"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            with open(path, encoding="utf-8") as handle:
+                record = parse_wireguard_client_conf(handle.read())
+        except OSError as error:
+            problems.append(f"cannot read {path}: {error}")
+            continue
+
+        public_key = None
+        pubkey_path = os.path.join(directory, f"{name}.wgpub")
+        if os.path.exists(pubkey_path):
+            try:
+                with open(pubkey_path, encoding="utf-8") as handle:
+                    public_key = handle.read().strip() or None
+            except OSError as error:
+                problems.append(f"cannot read {pubkey_path}: {error}")
+        record["public_key"] = public_key
+        users[name] = record
+
+    return users, problems
+
+
+def mikrotik_terse_output(command, username, host, port):
+    """Run one RouterOS print command over SSH and return its text.
+
+    Read-only by construction: the caller passes a `print` command. Returns
+    None on any failure, having said why, so that the audit reports nothing
+    rather than reporting an empty router as an empty registry.
+    """
+    ssh_client = paramiko.SSHClient()
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh_client.connect(hostname=host, username=username, port=port)
+        _stdin, stdout, stderr = ssh_client.exec_command(command)
+        output = stdout.read().decode(errors="replace")
+        error = stderr.read().decode(errors="replace").strip()
+        if error:
+            logger.error(f"{host}: {error}")
+            return None
+        return output
+    except Exception as error:
+        logger.error(f"cannot read {host}: {error}")
+        return None
+    finally:
+        ssh_client.close()
+
+
+def show_vpn_audit(target=None, host=None, username=None, port=None,
+                   as_json=False, directory=None):
+    """Compare figo's VPN user records with the peers the router enforces.
+
+    Writes nothing, anywhere. The interface to compare against is not given by
+    the operator and not read from a constant: it is the one whose public key
+    is the key the client files were written with. If no interface on the
+    router carries that key, the audit refuses -- that is a finding about the
+    deployment, not a usage error to work around.
+    """
+    users, problems = load_vpn_user_records(directory)
+    for problem in problems:
+        logger.warning(problem)
+
+    if not users:
+        logger.error(f"no client configuration found in {directory or USER_DIR}")
+        return
+
+    server_key = vpn_server_key(users)
+    if server_key is None:
+        logger.error("the client configurations do not agree on one server key; "
+                     "nothing can be compared against a single interface")
+        return
+
+    if target:
+        try:
+            host, username, port = get_host_from_target(target)
+        except ValueError:
+            return
+    else:
+        # No target named: audit the router figo writes to, with the same
+        # values the write path uses, so the two cannot drift apart.
+        host = host or SSH_MIKROTIK_HOST
+        username = username or SSH_MIKROTIK_USER_NAME
+        port = port or SSH_MIKROTIK_PORT
+
+    interfaces_text = mikrotik_terse_output(
+        "/interface wireguard print terse", username, host, port)
+    if interfaces_text is None:
+        return
+    interfaces = parse_mikrotik_terse(interfaces_text)
+
+    interface = wireguard_interface_for_server_key(interfaces, server_key)
+    if interface is None:
+        names = ", ".join(row.get("name", "?") for row in interfaces) or "none"
+        logger.error(f"no single WireGuard interface on {host} carries the server key "
+                     f"the clients were given; interfaces found: {names}")
+        return
+
+    peers_text = mikrotik_terse_output(
+        "/interface wireguard peers print terse", username, host, port)
+    if peers_text is None:
+        return
+    peers = [row for row in parse_mikrotik_terse(peers_text)
+             if row.get("interface") == interface]
+
+    findings = vpn_audit_findings(users, peers, base_address=BASE_IP_FOR_WG_VPN)
+
+    if as_json:
+        print(json.dumps({
+            "router": host,
+            "interface": interface,
+            "users": len(users),
+            "peers": len(peers),
+            "findings": findings,
+        }, indent=2))
+        return
+
+    for line in format_vpn_audit(findings, interface=interface,
+                                 user_count=len(users), peer_count=len(peers)):
+        print(line)
+
 
 def add_wireguard_vpn_user_on_mikrotik(public_key, ip_address, vpnuser, username=SSH_MIKROTIK_USER_NAME, 
                                  host=SSH_MIKROTIK_HOST, port=SSH_MIKROTIK_PORT, interface=WG_INTERFACE, 
@@ -10924,6 +11106,43 @@ def create_vpn_parser(subparsers):
     route_parser.add_argument("-u", "--user", help=f"SSH username for login into the node (default: {DEFAULT_SSH_USER_FOR_VPN_AR})")
     route_parser.add_argument("-p", "--port", type=int, help=f"SSH port (default: {DEFAULT_SSH_PORT_FOR_VPN_AR})")
 
+    # Audit subcommand
+    audit_parser = vpn_subparsers.add_parser(
+        "audit", help="Compare figo's VPN user records with the access router",
+        description="Compare the .conf files figo wrote with the WireGuard peers the\n"
+                    "access router enforces. Read-only: nothing is created, changed or\n"
+                    "removed, on either side.\n"
+                    "\n"
+                    "The interface to compare against is not asked for and not taken from\n"
+                    "a constant: it is the one on the router whose public key is the key\n"
+                    "the client configurations were written with. A router carrying more\n"
+                    "than one WireGuard interface is therefore handled by measurement, and\n"
+                    "if none of them matches, the audit says so instead of guessing.\n"
+                    "\n"
+                    "With no target and no host, the router figo writes users to is used,\n"
+                    "with the same credentials the write path uses.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  # Audit the router figo writes to\n"
+               "  figo vpn audit\n"
+               "\n"
+               "  # Audit a named access router from ACCESS_ROUTER_TARGETS\n"
+               "  figo vpn audit --target mikrotik-rm2\n"
+               "\n"
+               "  # Machine-readable output\n"
+               "  figo vpn audit --json\n"
+               "\n"
+    )
+    audit_where = audit_parser.add_mutually_exclusive_group()
+    audit_where.add_argument("--target", help="Access router named in ACCESS_ROUTER_TARGETS")
+    audit_where.add_argument("--host", help="Address of the access router")
+    audit_parser.add_argument("-u", "--user", help="SSH username for the access router")
+    audit_parser.add_argument("-p", "--port", type=int, help="SSH port for the access router")
+    audit_parser.add_argument("-d", "--dir", dest="directory",
+                              help=f"Directory holding the client configurations (default: {USER_DIR})")
+    audit_parser.add_argument("--json", dest="as_json", action="store_true",
+                              help="Print the findings as JSON")
+
     return vpn_parser
 
 def handle_vpn_command(args, parser_dict):
@@ -10966,6 +11185,9 @@ def handle_vpn_command(args, parser_dict):
             )
         else:
             logger.error("Unknown vpn add command.")
+    elif args.vpn_command == "audit":
+        show_vpn_audit(target=args.target, host=args.host, username=args.user,
+                       port=args.port, as_json=args.as_json, directory=args.directory)
 
 #############################################
 ###### figo storage command CLI #############

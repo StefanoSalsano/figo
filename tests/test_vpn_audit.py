@@ -290,3 +290,52 @@ def test_every_kind_produced_is_in_the_declared_order(figo):
          peer(public_key="KEY-OLD", comment="a-gauti", flags="X")],
         base_address="10.202.1.15")
     assert set(kinds(found)) <= set(figo.VPN_AUDIT_ORDER)
+
+
+# --- The server key, and what happens when the files disagree ---------------
+
+def test_the_server_key_comes_from_the_client_files(figo):
+    assert figo.vpn_server_key({"a": user(), "b": user(public_key="KEY-B")}) == SERVER_KEY
+
+
+def test_clients_configured_for_two_servers_cannot_be_audited_together(figo):
+    mixed = {"a": user(), "b": dict(user(public_key="KEY-B"), server_public_key="OTHER")}
+    assert figo.vpn_server_key(mixed) is None
+
+
+def test_no_server_key_anywhere(figo):
+    assert figo.vpn_server_key({"a": dict(user(), server_public_key=None)}) is None
+
+
+# --- A user figo cannot match at all ----------------------------------------
+
+def test_a_user_without_a_public_key_is_not_declared_peerless(figo):
+    """No .wgpub means no join key: saying 'no peer' would be a verdict."""
+    found = figo.vpn_audit_findings({"a-amici": dict(user(), public_key=None)}, [peer()])
+    assert kinds(found) == ["no-public-key", "orphan-peer-enabled"]
+
+
+# --- Rendering --------------------------------------------------------------
+
+def test_the_first_line_says_what_was_compared(figo):
+    lines = figo.format_vpn_audit([], interface="wireguard2", user_count=12, peer_count=23)
+    assert lines[0] == "interface wireguard2: 12 user records, 23 peers"
+    assert lines[1] == "the two registries agree."
+
+
+def test_one_record_is_singular(figo):
+    lines = figo.format_vpn_audit([], interface="wg", user_count=1, peer_count=1)
+    assert lines[0] == "interface wg: 1 user record, 1 peer"
+
+
+def test_the_counts_line_follows_the_declared_order(figo):
+    findings = [{"kind": "orphan-peer-enabled", "subject": "x", "detail": "d"},
+                {"kind": "duplicate-address", "subject": "10.202.1.19", "detail": "d"}]
+    lines = figo.format_vpn_audit(findings, interface="wg", user_count=2, peer_count=2)
+    assert lines[1] == "1 duplicate-address, 1 orphan-peer-enabled"
+
+
+def test_every_finding_is_rendered(figo):
+    findings = [{"kind": "no-peer", "subject": "a-amici", "detail": "allocated, never pushed"}]
+    lines = figo.format_vpn_audit(findings, interface="wg", user_count=1, peer_count=0)
+    assert any("a-amici" in line and "never pushed" in line for line in lines)
