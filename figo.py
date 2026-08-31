@@ -163,6 +163,13 @@ logger = logging.getLogger("_")
 # Suppress ws4py INFO logging
 logging.getLogger('ws4py').setLevel(logging.WARNING)
 
+# Same for paramiko: its INFO lines report the state of its own transport
+# ("Connected", "Authentication (publickey) successful!") on every SSH command,
+# which is noise in front of a report. Failures still reach the user, because
+# the callers catch the exception and log it themselves, and paramiko's own
+# warnings and errors are above this level.
+logging.getLogger('paramiko').setLevel(logging.WARNING)
+
 #############################################
 ###### generic helper functions         #####
 #############################################
@@ -5509,6 +5516,7 @@ def vpn_audit_findings(users, peers, base_address=None):
                              "detail": ", ".join(sorted(claims[address]))})
 
     matched_keys = set()
+    names_by_key = {}
     for name in sorted(users):
         record = users[name]
         key = record.get("public_key")
@@ -5524,29 +5532,17 @@ def vpn_audit_findings(users, peers, base_address=None):
                              "detail": f"{record.get('address')} allocated, no peer with this key"})
             continue
         matched_keys.add(key)
+        names_by_key[key] = name
         for peer in candidates:
             if "X" in (peer.get("flags") or ""):
                 findings.append({"kind": "peer-disabled", "subject": name,
                                  "detail": "the peer exists but is disabled"})
             entries = parse_allowed_addresses(peer.get("allowed-address", ""))
-            for address, prefix in entries:
-                if prefix != 32:
-                    findings.append({"kind": "allowed-address-wide", "subject": name,
-                                     "detail": f"{address}/{prefix} is not a /32"})
             addresses = [address for address, _ in entries]
             if record.get("address") and record["address"] not in addresses:
                 findings.append({"kind": "address-mismatch", "subject": name,
                                  "detail": f"conf says {record['address']}, router enforces "
                                            f"{', '.join(addresses) or 'nothing'}"})
-            # Only claimed when the client files agree on one subnet: without
-            # that, "outside the subnet" is a statement figo cannot support,
-            # and it would fire on every address of every user.
-            if subnet is not None:
-                for address, _ in entries:
-                    if ipaddress.ip_address(address) in subnet:
-                        continue
-                    findings.append({"kind": "allowed-address-extra", "subject": name,
-                                     "detail": f"{address} is allowed and is outside {subnet}"})
             comment = peer.get("comment")
             if comment and comment != name:
                 findings.append({"kind": "comment-mismatch", "subject": name,
@@ -5574,6 +5570,24 @@ def vpn_audit_findings(users, peers, base_address=None):
             if base_address and ipaddress.ip_address(address) < ipaddress.ip_address(base_address):
                 continue
             blind.append(address)
+
+    # How far a peer is allowed to reach is checked for every peer on the
+    # interface, not only for those with a .conf. A peer allowing more than a
+    # /32, or an address outside the client subnet, is the misconfiguration the
+    # anti-spoofing rule of Section 4.3 was meant to catch -- and an unmatched
+    # peer, which nobody has a record of, is where it is most likely to hide.
+    for peer in peers:
+        label = (names_by_key.get(peer.get("public-key")) or peer.get("comment")
+                 or peer.get("public-key") or "?")
+        for address, prefix in parse_allowed_addresses(peer.get("allowed-address", "")):
+            if prefix != 32:
+                findings.append({"kind": "allowed-address-wide", "subject": label,
+                                 "detail": f"{address}/{prefix} is not a /32"})
+            # Claimed only when the client files agree on one subnet: without
+            # that, "outside the subnet" is a statement figo cannot support.
+            if subnet is not None and ipaddress.ip_address(address) not in subnet:
+                findings.append({"kind": "allowed-address-extra", "subject": label,
+                                 "detail": f"{address} is allowed and is outside {subnet}"})
 
     if blind:
         findings.append({"kind": "allocator-blind", "subject": "next allocations",

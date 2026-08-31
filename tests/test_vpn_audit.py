@@ -339,3 +339,36 @@ def test_every_finding_is_rendered(figo):
     findings = [{"kind": "no-peer", "subject": "a-amici", "detail": "allocated, never pushed"}]
     lines = figo.format_vpn_audit(findings, interface="wg", user_count=1, peer_count=0)
     assert any("a-amici" in line and "never pushed" in line for line in lines)
+
+
+# --- How far a peer may reach is checked on every peer, not only on ours ----
+
+def test_an_orphan_peer_wider_than_a_slash_32_is_reported(figo):
+    """The misconfiguration of Section 4.3 hides best where nobody has a record.
+
+    Before this, the reach checks ran only on peers matched to a .conf, so a
+    hand-made peer allowing a whole /24 was reported as an orphan and nothing
+    else -- exactly the case the anti-spoofing rule was imagined for.
+    """
+    found = figo.vpn_audit_findings(
+        {"a-amici": user()},
+        [peer(), peer(public_key="KEY-HAND", comment="by-hand", address="10.202.1.0/24")])
+    assert "allowed-address-wide" in kinds(found)
+    assert any(item["subject"] == "by-hand" for item in found
+               if item["kind"] == "allowed-address-wide")
+
+
+def test_an_orphan_peer_reaching_outside_the_subnet_is_reported(figo):
+    found = figo.vpn_audit_findings(
+        {"a-amici": user()},
+        [peer(), peer(public_key="KEY-P", comment="Paolo GPUNet",
+                      address="10.202.1.5/32,192.168.33.5/32")])
+    extras = [item for item in found if item["kind"] == "allowed-address-extra"]
+    assert [item["subject"] for item in extras] == ["Paolo GPUNet"]
+
+
+def test_a_matched_peer_is_named_by_its_user_not_by_its_comment(figo):
+    found = figo.vpn_audit_findings({"a-amici": user()},
+                                    [peer(comment="Amici", address="10.202.1.19/24")])
+    wide = [item for item in found if item["kind"] == "allowed-address-wide"]
+    assert [item["subject"] for item in wide] == ["a-amici"]
