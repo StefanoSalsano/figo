@@ -6108,10 +6108,14 @@ def add_user(
             logger.error(f"Error: Client name not provided.")
             return False
         project_created = create_project(remote_name, project_name)
-
-    if not project_created:
-        logger.error(f"Error: Failed to create project '{project_name}', no certificate added.")
-        return False
+        if not project_created:
+            logger.error(f"Error: Failed to create project '{project_name}', no certificate added.")
+            return False
+    elif project is not None:
+        # A project was provided (-p): it already exists on local (verified
+        # above), so there is nothing to create and the certificate must be
+        # restricted to it.
+        project_name = project
 
     # Add the user certificate to Incus
     certificate_added = add_certificate_to_incus(
